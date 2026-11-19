@@ -1,0 +1,15 @@
+# Cloudflare deploys this worker from GitHub on every push to main.
+name = "sellercloud-link"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Keep the variables set in the Cloudflare dashboard (ASSEMBLE_ENABLED, ASSEMBLE_MAX_QTY and the rest).
+# Secrets (APP_KEY, PULL_KEY, ASSEMBLE_KEY, Sellercloud login) are never stored here and are kept by Cloudflare.
+keep_vars = true
+
+[[kv_namespaces]]
+binding = "TOKEN_KV"
+id = "a43f19df95e540fe8b489e3d8e60ee50"
+
+[triggers]
+crons = ["*/2 * * * *"]
