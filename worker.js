@@ -67,6 +67,8 @@
 //   time (bin list 10 min, catalog and kit parts 1 min, stock and bin qty 15 s); add &fresh=1 to read Sellercloud now.
 //   POST /assemble {sku,qty,itemId,fromBin,toBin[,source,perKit]}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //   /assemble/kit?sku=SKU          (ASSEMBLE_KEY) a product's kit parts and qty per kit (read-only)
+//   /assemble/companies  (ASSEMBLE_KEY) every Sellercloud company with its id (read-only)
+//   /assemble/catalog?company=ID_or_NAME[&q=WORD&sku=SKU&page=1&raw=1]  (ASSEMBLE_KEY) products in any company (read-only)
 //   /assemble/find?q=WORD[&page=1]  (ASSEMBLE_KEY) search warehouse-company products in Sellercloud for the
 //                                   final pick, out-of-stock ones included (read-only; 1-2 Sellercloud calls)
 //   /assemble/bridge?sku=SOURCE    (ASSEMBLE_KEY) the source's 0.1 oz bridge product: from its kit parts, and
@@ -3371,6 +3373,7 @@ async function handle(request, env) {
       return json(result);
     }
 
+    case "/assemble/companies":
     case "/companies": {
       let list = [];
       try {
@@ -3418,6 +3421,18 @@ async function handle(request, env) {
       const out = { warehouseId: assembleWarehouse(env), total: list.names.length, matches: hits.length, bins: hits.slice(0, cap) };
       if (url.searchParams.get("raw") === "1") out.rawReply = list.raw.slice(0, 3000);
       return json(out);
+    }
+
+    case "/assemble/catalog": {
+      // Read-only: products in ANY company (for the platform final-SKU feature).
+      // ?company= id or name (contains, any case), &q= keyword, &sku= exact SKU, &page=, &raw=1 adds the field names.
+      return json(await catalogLook(env, {
+        company: (url.searchParams.get("company") || "").trim(),
+        q: (url.searchParams.get("q") || "").trim(),
+        sku: (url.searchParams.get("sku") || "").trim(),
+        page: Math.max(1, parseInt(url.searchParams.get("page") || "1", 10)),
+        raw: url.searchParams.get("raw") === "1",
+      }));
     }
 
     case "/assemble/find": {
@@ -3734,6 +3749,49 @@ async function handle(request, env) {
     default:
       return json({ error: "Unknown path. Try /health, /products, /qty, /companies, /warehouses, /images or /sync." }, 404);
   }
+}
+
+// ---- Platform catalog look-ups (read-only GETs). Nov 19: Shragy wants the Hub to make a production's final SKU in a
+// platform company (Temu, LG DEALS LLC, EAST AND WEST SALES, Walmart company, WOOT); these read how those SKUs look.
+async function companyList(env) {
+  const data = await scGet(env, "/Companies", { pageNumber: 1, pageSize: 500 });
+  return (Array.isArray(data) ? data : data?.Items || data?.Companies || []).map((c) => ({
+    companyId: c.ID ?? c.Id ?? c.CompanyID ?? null,
+    company: c.CompanyName ?? c.Name ?? null,
+  }));
+}
+const normCo = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+function pickCompany(list, want) {
+  if (/^\d+$/.test(want)) return list.find((c) => String(c.companyId) === want) || { companyId: want, company: null };
+  const w = normCo(want);
+  return list.find((c) => normCo(c.company) === w) || list.find((c) => normCo(c.company).includes(w)) || null;
+}
+function catalogRow(p) {
+  return {
+    sku: p.ID ?? p.ProductID ?? null,
+    name: p.ProductName ?? null,
+    companyId: p.CompanyID ?? null,
+    company: p.CompanyName ?? null,
+    type: p.ProductType ?? p.ProductTypeName ?? null,
+    kit: p.IsKit ?? p.Kit ?? null,
+    created: p.CreatedOn ?? p.DateCreated ?? null,
+    available: num(p.InventoryAvailableQty),
+  };
+}
+async function catalogLook(env, { company, q, sku, page = 1, raw = false }) {
+  let co = null;
+  if (company) {
+    co = pickCompany(await companyList(env), company);
+    if (!co) throw new HttpError(404, `No Sellercloud company matches "${company}".`);
+  }
+  const params = { pageNumber: page, pageSize: 50, companyID: co ? [co.companyId] : undefined };
+  if (q) params.Keyword = q;
+  if (sku) params.SKU = [sku];
+  const data = await scGet(env, "/catalog", params);
+  const items = (data.Items || []).filter((p) => !co || String(p.CompanyID) === String(co.companyId));
+  const out = { company: co, q: q || null, sku: sku || null, page, totalResults: data.TotalResults ?? null, items: items.map(catalogRow) };
+  if (raw && items[0]) out.fieldsOfFirst = Object.keys(items[0]);
+  return out;
 }
 
 export default {
