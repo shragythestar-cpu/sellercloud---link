@@ -13,3 +13,12 @@ id = "a43f19df95e540fe8b489e3d8e60ee50"
 
 [triggers]
 crons = ["*/2 * * * *"]
+
+# Background kit runs (Nov 19): one Durable Object keeps the queue of kit runs and steps them with its alarm.
+[[durable_objects.bindings]]
+name = "JOBS"
+class_name = "JobQueue"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["JobQueue"]

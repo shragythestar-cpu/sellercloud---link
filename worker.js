@@ -86,6 +86,12 @@
 //                                   gets one line per 0.1 product (this run's units ÷ produced); one assembly; each
 //                                   0.1 product's leftover removed. Weight in vs final size × produced: over the limit,
 //                                   or a source type not clear (unknownTypes), blocks setup and produce.
+//   Background runs (Durable Object JobQueue, binding JOBS; ASSEMBLE_KEY):
+//     POST /assemble/job {the fields setup and produce take, itemId, userId[, fba]}  checks the kit (read-only) and
+//                                   queues it; the worker then runs setup and produce by itself, one step at a time.
+//     GET  /assemble/job?itemId=a[&itemIds=b,c] or ?jobIds=x,y   each job's state, step n of total, steps, result.
+//     GET  /assemble/jobs[?active=1]   every job (active=1: running, waiting, or finished and not acked yet).
+//     POST /assemble/job/cancel {itemId|jobId}   only before it starts.   POST /assemble/job/ack {jobIds}   board written.
 //   /soapops?type=Name                          the fields of one SOAP data type and their types (read-only)
 //   /cachecheck                                 whether the worker's saved-step memory works on this address (read-only)
 //   /assemblediag[?part=calls|send|stock|rest&sku=FINAL&fromBin=&toBin=] read-only assemble checks, one light part per call                 read-only: every Sellercloud assemble call and its fields, kit part fields,
@@ -2515,6 +2521,384 @@ async function mixProduce(env, body) {
     breakdowns, removed, parts: run.parts };
 }
 
+// ---- Background kit runs (Shragy, Nov 19: "i want to be able to close a kit while its assembling and move on to the
+// next ... it shold show exectly whats happening"). The Hub hands a kit to the worker once (POST /assemble/job) and
+// can close the pop-up; a Durable Object (JobQueue, binding JOBS) keeps every job and drives it with its alarm, one
+// step at a time: the same setup and produce code the Hub's own loop calls, with the same once-only records, so a
+// job can never assemble or break down twice. Several kits run at once, a step of each in turn. A kit that shares a
+// source product or its final with an earlier kit still running (or stopped and waiting to be cleared) waits for it.
+// The Hub reads each job's steps and writes the board itself once a job is done, then acks it.
+const JOB_STEP_MS = 25_000;            // one step's time box (the same as a Hub call)
+const JOB_STUCK_MS = 20 * 60_000;       // no step finished for this long: stop with the last message
+const JOB_KEEP_MS = 3 * 86400_000;      // finished jobs the Hub has acked are kept this long
+const JOB_ACTIVE = new Set(["queued", "waiting", "running"]);
+const jobKeyOf = (id) => "job:" + id;
+const jobItemKey = (itemId) => "item:" + String(itemId).toLowerCase();
+function callInit(env, ms) {
+  reqEnv = env; RUN_KV = env.TOKEN_KV || null; callStart = Date.now(); deadline = callStart + ms; readCacheOn = false; quickBusy = false;
+}
+// What the Hub reads back for an item (assembleSent, assembleConfirmed, disassembleSent, leftoverRemoved).
+async function itemSentFlags(iid) {
+  if (!iid || !RUN_KV) return { assembleSent: null, disassembleSent: null };
+  const asm = [iid, iid + "#g1", iid + "#g2", iid + "#g3"];
+  let a = false, conf = null;
+  for (const k of asm) {
+    const hit = await durable.match(doneKey(k));
+    if (!hit) continue;
+    a = true;
+    let rec = null; try { rec = JSON.parse(await hit.text()); } catch {}
+    const ok = !!rec && rec.confirmed !== false && !rec.recipeUsed;
+    conf = conf === null ? ok : conf && ok;
+  }
+  return { assembleSent: a, assembleConfirmed: a ? !!conf : false, disassembleSent: !!(await durable.match(lockKey("disassembled", iid))),
+    leftoverRemoved: !!(await durable.match(lockKey("emptied", iid))) };
+}
+// Has this item already started (any run record)? Then the job carries on from its records instead of re-planning.
+async function itemStarted(itemId) {
+  if (!RUN_KV) return false;
+  for (const k of [doneKey(itemId), lockKey("disrec", itemId), lockKey("disassembled", itemId), lockKey("mixrun", itemId), lockKey("groups", itemId)])
+    if (await durable.match(k)) return true;
+  return false;
+}
+const SETUP_STEPS = new Set(["0.1 product", "empty source", "source kit", "put back source", "final kit"]);
+// Each plan step is keyed by its kind and the product it's about (a single kit's lines often carry no SKU).
+function planStepSku(s, plan) {
+  const src = plan.source?.sku || s.from || "";
+  switch (s.step) {
+    case "0.1 product": return plan.mode === "mix" ? s.sku : src;
+    case "empty source": case "put back source": case "source kit": case "disassemble": return s.sku || src;
+    case "final kit": case "assemble": return plan.final?.sku || "";
+    default: return s.sku || "";
+  }
+}
+const jobStepKey = (step, sku) => `${step}|${String(sku || "").toLowerCase()}`;
+function jobLabel(s, plan) {
+  const src = planStepSku(s, plan), fin = plan.final?.sku || "";
+  switch (s.step) {
+    case "0.1 product": return `Creating 0.1 product ${s.bridgeSku || s.sku}`;
+    case "empty source": return `Emptying ${src} to set its kit`;
+    case "source kit": return `Setting ${src} as a kit`;
+    case "put back source": return `Putting ${src} back`;
+    case "final kit": return s.state === "to change" ? `Changing ${fin}'s recipe` : `Setting ${fin}'s recipe`;
+    case "disassemble": return `Breaking down ${src}`;
+    case "assemble": return `Assembling ${plan.produced} × ${fin}`;
+    case "empty leftover": return `Removing leftover ${s.sku || "0.1"}`;
+    default: return s.step;
+  }
+}
+// The job's step list from the plan: every step still to do (steps already in place are left out).
+function jobStepsFrom(plan) {
+  const out = [];
+  for (const s of plan.steps) {
+    if (["0.1 product", "source kit", "final kit", "disassemble"].includes(s.step) && s.action === "skip") continue;
+    if (s.step === "empty leftover" && !(s.qty > 0)) continue;
+    const keySku = planStepSku(s, plan);
+    out.push({ key: jobStepKey(s.step, keySku), keySku, step: s.step, phase: SETUP_STEPS.has(s.step) ? "setup" : "produce",
+      label: jobLabel(s, plan), sku: s.step === "0.1 product" ? (s.bridgeSku || s.sku) : keySku || null, status: "pending" });
+  }
+  // In the order they run: all setup (the final's recipe included) before any break-down.
+  return [...out.filter((x) => x.phase === "setup"), ...out.filter((x) => x.phase === "produce")];
+}
+// Setup steps that a fresh plan shows in place (or gone) are done. Emptying and putting back are done once the kit
+// is (a plan only comes back when no source is still emptied).
+function jobMarkFromPlan(job, plan) {
+  const byKey = new Map(plan.steps.map((s) => [jobStepKey(s.step, planStepSku(s, plan)), s]));
+  for (const st of job.steps) {
+    if (st.phase !== "setup" || st.status === "done") continue;
+    const p = byKey.get(st.step === "put back source" || st.step === "empty source" ? jobStepKey("source kit", st.keySku) : st.key);
+    if (!p || p.action === "skip") st.status = "done";
+  }
+}
+// Produce steps from the item's records (no Sellercloud calls).
+async function jobMarkFromRecords(job) {
+  const itemId = job.itemId;
+  for (const st of job.steps) {
+    if (st.phase !== "produce" || st.status === "done") continue;
+    if (st.step === "disassemble") {
+      const rec = job.mode === "mix" ? await readRec("disrec", mixKey(itemId, st.keySku)) : await readRec("disrec", itemId);
+      if (rec) st.status = "done";
+    } else if (st.step === "assemble") {
+      const hit = await durable.match(doneKey(itemId));
+      if (hit) { let rec = null; try { rec = JSON.parse(await hit.text()); } catch {} if (rec && rec.confirmed !== false && !rec.recipeUsed) st.status = "done"; }
+    }
+  }
+}
+function jobCurrent(job) {
+  const i = job.steps.findIndex((s) => s.status !== "done");
+  return i < 0 ? null : i;
+}
+function jobView(job) {
+  const i = jobCurrent(job);
+  const total = job.steps.length;
+  return {
+    jobId: job.id, itemId: job.itemId, state: job.state, phase: job.phase, mode: job.mode, final: job.final, produced: job.produced,
+    sources: job.sources, fromBin: job.fromBin, toBin: job.toBin, waitingFor: job.waitingFor || null,
+    step: i == null ? total : i + 1, total,
+    current: job.state === "done" ? "Done" : job.state === "waiting" ? `Waiting for ${job.waitingForLabel || "another kit"} to finish`
+      : i == null ? (job.state === "running" || job.state === "queued" ? "Finishing" : null) : job.steps[i].label,
+    detail: job.detail || null,
+    steps: job.steps.map((s) => ({ label: s.label, sku: s.sku, phase: s.phase, status: s.status, error: s.error || null })),
+    result: job.result || null, error: job.error || null, failedStep: job.failedStep || null, critical: !!job.critical,
+    needsClear: job.state === "needs-clear", sentFlags: job.sentFlags || null,
+    startedAt: new Date(job.createdAt).toISOString(), updatedAt: new Date(job.updatedAt).toISOString(),
+    finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : null, startedBy: job.startedBy || null, boardWritten: !!job.ackedAt,
+  };
+}
+function jobStop(job, state, error, extra = {}) {
+  const i = jobCurrent(job);
+  if (i != null) { job.steps[i].status = "failed"; job.steps[i].error = error; job.failedStep = job.steps[i].label; }
+  job.state = state; job.error = error; job.finishedAt = Date.now(); Object.assign(job, extra);
+}
+// One step of one job. Changes job in place; returns ms until its next step.
+async function jobAdvance(env, job) {
+  const now = Date.now();
+  const before = job.steps.filter((s) => s.status === "done").length + "|" + job.phase;
+  const body = { ...job.body, itemId: job.itemId };
+  const busyWait = (e) => {
+    const at = e.retryAt ? Date.parse(e.retryAt) : NaN;
+    job.detail = `Sellercloud is busy${e.call ? ` (${e.call})` : ""}; trying again${Number.isFinite(at) ? " at " + timeET(at) : " in a minute"}.`;
+    return Number.isFinite(at) && at > now ? Math.min(at - now + 1000, 15 * 60_000) : 60_000;
+  };
+  let wait = 1500;
+  job.state = "running";
+  if (job.phase === "setup") {
+    let r;
+    try { r = await setupProduction(env, { ...body, state: job.setupState || {} }); }
+    catch (e) {
+      if (e.busy) return busyWait(e);
+      jobStop(job, "failed", e.message || String(e));
+      return 0;
+    }
+    if (r.state) job.setupState = r.state;
+    if (r.plan) jobMarkFromPlan(job, r.plan);
+    job.detail = r.message || r.error || null;
+    if (r.saved) {
+      for (const s of job.steps) if (s.phase === "setup") s.status = "done";
+      job.phase = "produce"; job.pendingTries = 0;
+    } else if (r.continue) {
+      wait = /Still working on the last step|Waiting for/.test(r.message || "") ? 4000 : 1500;
+    } else if (r.pending) {
+      job.pendingTries = (job.pendingTries || 0) + 1;
+      if (job.pendingTries > 2) jobStop(job, "failed", r.message || "Sellercloud didn't show the kit.");
+      else { job.detail = `${r.message} Trying again in a minute.`; wait = 60_000; }
+    } else {
+      jobStop(job, "failed", r.error || r.message || "Setup stopped.", { critical: !!r.critical });
+      return 0;
+    }
+  } else {
+    let r = null, err = null;
+    try { r = await produceProduction(env, body); }
+    catch (e) {
+      if (e.busy) return busyWait(e);
+      err = e.message || String(e);
+    }
+    const flags = await itemSentFlags(job.itemId).catch(() => null);
+    job.sentFlags = flags;
+    const prevDone = new Set(job.steps.filter((s) => s.status === "done").map((s) => s.key));
+    await jobMarkFromRecords(job).catch(() => {});
+    if (r?.done) {
+      for (const s of job.steps) s.status = "done";
+      job.state = "done"; job.finishedAt = Date.now(); job.detail = r.message;
+      job.result = { qty: job.produced, final: job.final, destination: job.toBin, message: r.message,
+        parts: r.parts || (r.assemble?.parts ?? null), removed: r.removed || null };
+      return 0;
+    }
+    if (r?.removed) for (const x of r.removed) if (x.ok) { const st = job.steps.find((s) => s.step === "empty leftover" && s.keySku.toLowerCase() === String(x.sku).toLowerCase()); if (st) st.status = "done"; }
+    if (r && r.continue) { job.detail = r.message || null; wait = /^Broke down \d+ so far|Carrying on/.test(r.message || "") ? 1500 : 4000; }
+    else {
+      const msg = err || r?.message || r?.error || "Stopped.";
+      const sent = !!(flags && (flags.disassembleSent || flags.assembleSent)) || ["no break-down record", "partly changed"].includes(r?.status);
+      // A break-down's record is saved before it's sent, so one that failed shows as the failed step, not as done.
+      if (/disassembl|break-down|breaking down|numbers off/i.test(r?.status || ""))
+        for (const st of job.steps) if (st.step === "disassemble" && !prevDone.has(st.key)) st.status = "pending";
+      jobStop(job, sent ? "needs-clear" : "failed", msg, { status: r?.status || null });
+      return 0;
+    }
+  }
+  const after = job.steps.filter((s) => s.status === "done").length + "|" + job.phase;
+  if (after !== before || !job.progressAt) job.progressAt = Date.now();
+  else if (Date.now() - job.progressAt > JOB_STUCK_MS) {
+    const last = job.detail || "no news from Sellercloud";
+    const sent = !!(job.sentFlags && (job.sentFlags.disassembleSent || job.sentFlags.assembleSent));
+    jobStop(job, sent ? "needs-clear" : "failed", `Stopped after ${Math.round(JOB_STUCK_MS / 60000)} minutes without a step finishing. Last: ${last}`);
+    return 0;
+  }
+  return wait;
+}
+// Kits that can't run side by side: same source product (setup empties all its bins) or same final (its recipe).
+const jobLocks = (job) => [...(job.sources || []).map((x) => "src:" + x.toLowerCase()), "fin:" + String(job.final || "").toLowerCase()];
+
+export class JobQueue {
+  constructor(state, env) { this.state = state; this.env = env; this.storage = state.storage; }
+  async all() { return [...(await this.storage.list({ prefix: "job:" })).values()]; }
+  async save(job) { job.updatedAt = Date.now(); await this.storage.put(jobKeyOf(job.id), job); }
+  async latestFor(itemId) { const id = await this.storage.get(jobItemKey(itemId)); return id ? await this.storage.get(jobKeyOf(id)) : null; }
+  // Waiting jobs: free to run once nothing earlier that shares a source or final is running or waiting to be cleared.
+  async refreshWaiting(jobs) {
+    const blocking = (j) => JOB_ACTIVE.has(j.state) || j.state === "needs-clear";
+    for (const j of jobs.filter((x) => x.state === "queued" || x.state === "waiting").sort((a, b) => a.createdAt - b.createdAt)) {
+      const mine = new Set(jobLocks(j));
+      const blocker = jobs.find((o) => o.id !== j.id && o.createdAt < j.createdAt && blocking(o) && jobLocks(o).some((l) => mine.has(l)));
+      const next = blocker ? "waiting" : "queued";
+      if (j.state !== next || (j.waitingFor || null) !== (blocker?.itemId || null)) {
+        j.state = next; j.waitingFor = blocker?.itemId || null;
+        j.waitingForLabel = blocker ? `${blocker.final}${blocker.state === "needs-clear" ? " (stopped; clear it first)" : ""}` : null;
+        if (!blocker) j.nextAt = Date.now();
+        await this.save(j);
+      }
+    }
+  }
+  async schedule() {
+    const jobs = await this.all();
+    const runnable = jobs.filter((j) => j.state === "queued" || j.state === "running");
+    if (!runnable.length) { await this.storage.deleteAlarm(); return; }
+    const at = Math.max(Date.now() + 250, Math.min(...runnable.map((j) => j.nextAt || 0)));
+    const cur = await this.storage.getAlarm();
+    if (cur == null || cur > at || cur < Date.now() - 60_000) await this.storage.setAlarm(at);
+  }
+  async fetch(request) {
+    const url = new URL(request.url);
+    let body = {};
+    if (request.method === "POST") { try { body = (await request.json()) || {}; } catch {} }
+    const out = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
+    switch (url.pathname) {
+      case "/add": {
+        const itemId = String(body.itemId || "").trim();
+        const prev = await this.latestFor(itemId);
+        if (prev && JOB_ACTIVE.has(prev.state)) return out({ job: jobView(prev), existing: true });
+        if (prev && prev.state === "needs-clear") return out({ error: `This kit stopped part way (${prev.error}). Check Sellercloud, then Clear and allow retry before running it again.`, job: jobView(prev) }, 409);
+        if (prev && prev.state === "done" && !body.again) return out({ error: "This kit was already assembled by a background run.", job: jobView(prev) }, 409);
+        const now = Date.now();
+        const job = { id: "j" + now.toString(36) + Math.random().toString(36).slice(2, 7), itemId, body: body.body, mode: body.mode, final: body.final,
+          sources: body.sources, fromBin: body.fromBin, toBin: body.toBin, produced: body.produced, startedBy: body.startedBy || null,
+          steps: body.steps, phase: body.steps.some((s) => s.phase === "setup") ? "setup" : "produce", state: "queued", createdAt: now, updatedAt: now, nextAt: now };
+        await this.save(job);
+        await this.storage.put(jobItemKey(itemId), job.id);
+        await this.refreshWaiting(await this.all());
+        await this.schedule();
+        return out({ job: jobView(await this.storage.get(jobKeyOf(job.id))) });
+      }
+      case "/get": {
+        const ids = (body.jobIds || []).map(String), items = (body.itemIds || []).map(String);
+        const jobs = [];
+        for (const id of ids) { const j = await this.storage.get(jobKeyOf(id)); if (j) jobs.push(jobView(j)); }
+        for (const it of items) { const j = await this.latestFor(it); if (j) jobs.push(jobView(j)); }
+        return out({ jobs });
+      }
+      case "/list": {
+        const jobs = (await this.all()).sort((a, b) => a.createdAt - b.createdAt);
+        const pick = body.active ? jobs.filter((j) => JOB_ACTIVE.has(j.state) || !j.ackedAt) : jobs;
+        return out({ jobs: pick.map(jobView) });
+      }
+      case "/cancel": {
+        const j = body.jobId ? await this.storage.get(jobKeyOf(body.jobId)) : await this.latestFor(body.itemId || "");
+        if (!j) return out({ error: "No background run for this kit." }, 404);
+        if (j.state === "running") return out({ error: "This kit is already running; it can't be stopped part way. It stops by itself if a step fails.", job: jobView(j) }, 409);
+        if (j.state !== "queued" && j.state !== "waiting") return out({ error: `This run is ${j.state}, not waiting.`, job: jobView(j) }, 409);
+        j.state = "cancelled"; j.finishedAt = Date.now(); j.detail = "Cancelled before it started."; j.ackedAt = Date.now();
+        await this.save(j);
+        await this.refreshWaiting(await this.all());
+        await this.schedule();
+        return out({ job: jobView(j) });
+      }
+      case "/ack": {
+        const done = [];
+        for (const id of (body.jobIds || []).map(String)) {
+          const j = await this.storage.get(jobKeyOf(id));
+          if (j && !JOB_ACTIVE.has(j.state) && !j.ackedAt) { j.ackedAt = Date.now(); await this.save(j); done.push(id); }
+        }
+        return out({ acked: done });
+      }
+      case "/active": {
+        const j = await this.latestFor(body.itemId || "");
+        return out({ active: !!(j && JOB_ACTIVE.has(j.state)), job: j ? jobView(j) : null });
+      }
+      case "/forget": {
+        // After Clear and allow retry: the item's stopped job goes, so the kit can run again and kits waiting on it go ahead.
+        const j = await this.latestFor(body.itemId || "");
+        if (j && JOB_ACTIVE.has(j.state)) return out({ error: "This kit is still running in the background.", job: jobView(j) }, 409);
+        if (j) { await this.storage.delete(jobKeyOf(j.id)); await this.storage.delete(jobItemKey(j.itemId)); }
+        await this.refreshWaiting(await this.all());
+        await this.schedule();
+        return out({ forgot: !!j });
+      }
+      case "/kick": { await this.refreshWaiting(await this.all()); await this.schedule(); return out({ ok: true }); }
+    }
+    return out({ error: "Unknown job call." }, 404);
+  }
+  async alarm() {
+    const env = this.env;
+    callInit(env, JOB_STEP_MS);
+    try {
+      let jobs = await this.all();
+      await this.refreshWaiting(jobs);
+      jobs = await this.all();
+      const now = Date.now();
+      const due = jobs.filter((j) => (j.state === "queued" || j.state === "running") && (j.nextAt || 0) <= now)
+        .sort((a, b) => (a.lastRunAt || 0) - (b.lastRunAt || 0))[0];
+      if (due) {
+        await markHubActive(env).catch(() => {});
+        let wait = 0;
+        try { wait = await jobAdvance(env, due); }
+        catch (e) { jobStop(due, "failed", e.message || String(e)); }
+        due.lastRunAt = Date.now();
+        due.nextAt = Date.now() + (wait || 0);
+        await this.save(due);
+        if (!JOB_ACTIVE.has(due.state)) await this.refreshWaiting(await this.all());
+      }
+      // Finished jobs the Hub has acked go after a few days.
+      for (const j of await this.all())
+        if (!JOB_ACTIVE.has(j.state) && j.ackedAt && Date.now() - (j.finishedAt || j.updatedAt) > JOB_KEEP_MS) {
+          await this.storage.delete(jobKeyOf(j.id));
+          if ((await this.storage.get(jobItemKey(j.itemId))) === j.id) await this.storage.delete(jobItemKey(j.itemId));
+        }
+    } finally {
+      await tallyCalls(env).catch(() => {});
+      await this.schedule();
+    }
+  }
+}
+const jobStub = (env) => env.JOBS.get(env.JOBS.idFromName("queue"));
+async function jobCall(env, path, body) {
+  if (!env.JOBS) throw new HttpError(501, "Background runs aren't set up on this worker yet (no JOBS Durable Object binding).");
+  const r = await jobStub(env).fetch(new Request("https://jobs" + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) }));
+  const o = await r.json();
+  return { status: r.status, ...o };
+}
+// POST /assemble/job: checks the kit the way setup and produce would (read-only), then hands it to the queue.
+async function startJob(env, body) {
+  if (!assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off. It turns on once ASSEMBLE_ENABLED is set to yes.");
+  if (!RUN_KV) throw needKv();
+  if (!env.JOBS) throw new HttpError(501, "Background runs aren't set up on this worker yet (no JOBS Durable Object binding).");
+  const itemId = String(body.itemId || "").trim();
+  if (!itemId) throw new HttpError(400, "itemId (the monday item) is needed.");
+  const fromBin = String(body.fromBin || "").trim(), toBin = String(body.toBin || "").trim();
+  if (!fromBin || !toBin) throw new HttpError(400, "fromBin and toBin are needed.");
+  if (body.fba === true || body.fba === "yes") {
+    const fbaBin = String(env.FBA_BIN || "FBA_manual_import").trim();
+    if (toBin.toLowerCase() !== fbaBin.toLowerCase()) throw new HttpError(409, `FBA productions always assemble into bin ${fbaBin}, not ${toBin}.`);
+  }
+  const active = await jobCall(env, "/active", { itemId });
+  if (active.active) return { job: active.job, existing: true };
+  const mix = isMix(body);
+  const clean = { ...body }; delete clean.state;
+  await realBin(env, binName(fromBin), "From"); await realBin(env, binName(toBin), "To");
+  const plan = mix ? await mixPlan(env, await withMixRun(clean)) : await productionPlan(env, await withRunPer(clean));
+  const started = await itemStarted(itemId);
+  if (!started) {
+    const problems = [...plan.problems, ...(plan.unknownTypes?.length ? [`Pick bulk by lb or oz for ${plan.unknownTypes.join(", ")}.`] : [])];
+    if (problems.length) throw Object.assign(new HttpError(409, problems.join(" ")), { plan });
+  }
+  const steps = jobStepsFrom(plan);
+  const r = await jobCall(env, "/add", {
+    itemId, body: clean, mode: mix ? "mix" : "single", final: plan.final?.sku || String(body.final || ""),
+    sources: mix ? listParam(body.sources) : [String(body.source || "").trim()], fromBin, toBin, produced: plan.produced,
+    startedBy: body.userId || body.startedBy || null, steps,
+  });
+  if (r.status !== 200) throw Object.assign(new HttpError(r.status, r.error || "Couldn't start the run."), { job: r.job });
+  return { job: r.job, existing: !!r.existing };
+}
+
 async function setupProduction(env, body) {
   if (!RUN_KV) throw needKv();
   // One setup call at a time per final kit, so two quick presses can't both empty the source.
@@ -2871,8 +3255,9 @@ async function handle(request, env) {
   const url = new URL(request.url);
   const p0 = url.pathname.replace(/\/+$/, "");
   const isAssemble = p0 === "/assemble";
-  const isPost = isAssemble || p0 === "/assemble/setup" || p0 === "/assemble/produce" || p0 === "/assemble/refresh" || p0 === "/assemble/clear";
-  const okMethod = isPost ? request.method === "POST" : request.method === "GET";
+  const isPost = isAssemble || p0 === "/assemble/setup" || p0 === "/assemble/produce" || p0 === "/assemble/refresh" || p0 === "/assemble/clear"
+    || p0 === "/assemble/job/cancel" || p0 === "/assemble/job/ack";
+  const okMethod = p0 === "/assemble/job" ? ["GET", "POST"].includes(request.method) : isPost ? request.method === "POST" : request.method === "GET";
   if (!okMethod)
     return json({ error: isPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
 
@@ -3111,6 +3496,10 @@ async function handle(request, env) {
       const itemId = String(body.itemId || "").trim();
       if (!itemId) return json({ error: "itemId is needed." }, 400);
       if (!RUN_KV) throw needKv();
+      if (env.JOBS) {
+        const a = await jobCall(env, "/active", { itemId });
+        if (a.active) return json({ error: "This kit is still running in the background. Wait until it finishes or stops.", job: a.job }, 409);
+      }
       const keys = [doneKey(itemId), doneKey(itemId + "#g1"), doneKey(itemId + "#g2"), doneKey(itemId + "#g3"),
         ...["groups", "disassembled", "disrec", "emptied", "leftover", "mixrun"].map((k) => lockKey(k, itemId))];
       // A mix run's records per source and per 0.1 product.
@@ -3119,8 +3508,39 @@ async function handle(request, env) {
       for (const x of mr?.parts || []) keys.push(lockKey("emptied", mixKey(itemId, x.sku)));
       const had = [];
       for (const k of keys) { if (await durable.match(k)) had.push(new URL(k.url).pathname.split("/")[1]); await durable.delete(k); }
+      if (env.JOBS) await jobCall(env, "/forget", { itemId }).catch(() => null);
       return json({ cleared: true, itemId, had: [...new Set(had)],
         message: had.length ? `Cleared this production's run records (${[...new Set(had)].join(", ")}). Check Sellercloud first: the next Run sends again.` : "This production had no run records." });
+    }
+
+    case "/assemble/job": {
+      if (request.method === "GET") {
+        const ids = (url.searchParams.get("jobIds") || "").split(",").map((x) => x.trim()).filter(Boolean);
+        const items = [...url.searchParams.getAll("itemId"), ...(url.searchParams.get("itemIds") || "").split(",")].map((x) => x.trim()).filter(Boolean);
+        if (!ids.length && !items.length) return json({ error: "Add ?itemId= or ?jobIds=." }, 400);
+        const r = await jobCall(env, "/get", { jobIds: ids, itemIds: items });
+        return json({ jobs: r.jobs || [] });
+      }
+      let body;
+      try { body = await request.json(); } catch { return json({ error: "Send the details as JSON." }, 400); }
+      try { return json(await startJob(env, body || {})); }
+      catch (e) {
+        const st = e instanceof HttpError ? e.status : 500;
+        return json({ error: e.message || String(e), ...(e.busy ? { busy: true, call: e.call, said: e.said, retryAt: e.retryAt || null } : {}),
+          ...(e.plan ? { plan: e.plan } : {}), ...(e.job ? { job: e.job } : {}) }, st);
+      }
+    }
+    case "/assemble/jobs": {
+      const r = await jobCall(env, "/list", { active: url.searchParams.get("active") === "1" });
+      return json({ jobs: r.jobs || [] });
+    }
+    case "/assemble/job/cancel":
+    case "/assemble/job/ack": {
+      let body = {};
+      try { body = (await request.json()) || {}; } catch {}
+      const r = await jobCall(env, p0 === "/assemble/job/ack" ? "/ack" : "/cancel", body);
+      const { status, ...rest } = r;
+      return json(rest, status);
     }
 
     case "/assemble/setup":
@@ -3131,23 +3551,7 @@ async function handle(request, env) {
       // assembleSent / disassembleSent (for the Hub, Nov 19): true once that item's assembly or break-down has been
       // sent to Sellercloud, confirmed or not. The Hub stops calling by itself once assembleSent is true and not done.
       const iid = String(body?.itemId || "").trim();
-      const sentFlags = async () => {
-        if (!iid || !RUN_KV) return { assembleSent: null, disassembleSent: null };
-        const asm = [iid, iid + "#g1", iid + "#g2", iid + "#g3"];
-        let a = false, conf = null;
-        for (const k of asm) {
-          const hit = await durable.match(doneKey(k));
-          if (!hit) continue;
-          a = true;
-          let rec = null; try { rec = JSON.parse(await hit.text()); } catch {}
-          const ok = !!rec && rec.confirmed !== false && !rec.recipeUsed;
-          conf = conf === null ? ok : conf && ok;
-        }
-        // assembleConfirmed: every assembly of the item is confirmed in Sellercloud. Then a continue:true reply is
-        // only the leftover removal (its own once-only lock), so the Hub can keep calling.
-        return { assembleSent: a, assembleConfirmed: a ? !!conf : false, disassembleSent: !!(await durable.match(lockKey("disassembled", iid))),
-          leftoverRemoved: !!(await durable.match(lockKey("emptied", iid))) };
-      };
+      const sentFlags = () => itemSentFlags(iid);
       let r;
       try { r = await produceProduction(env, body || {}); }
       catch (e) {
@@ -3340,6 +3744,8 @@ export default {
     quickBusy = false;
     ctx.waitUntil(runSync(env, { seconds: 120, scheduled: true }).catch((e) => console.log("sync failed: " + e.message))
       .finally(() => tallyCalls(env)));
+    // Background kit runs: a nudge so the queue's alarm is never lost.
+    if (env.JOBS) ctx.waitUntil(jobCall(env, "/kick", {}).catch(() => {}));
   },
   async fetch(request, env, ctx) {
     reqOrigin = request.headers.get("Origin") || "";
