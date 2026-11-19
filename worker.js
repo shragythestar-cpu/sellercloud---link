@@ -79,6 +79,13 @@
 //   POST /assemble/produce {source,final,fromBin,toBin,produced,itemId}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //                                   disassembles the source in the From bin into 0.1 units, assembles the finals, then
 //                                   removes the small 0.1 leftover (less than one final's worth) from the From bin
+//   Mix kits (one final from 2+ sources): plan, setup and produce take sources (2+ SKUs: JSON array, repeated
+//                                   ?sources= or a comma list) instead of source, plus types (picked per source:
+//                                   {"SKU":"lb"|"oz"} or "SKU:lb,SKU:oz") and maxDiffPct (weight check, default 10).
+//                                   Each source breaks down into its own 0.1 product in the 0.1 bin; the final's recipe
+//                                   gets one line per 0.1 product (this run's units ÷ produced); one assembly; each
+//                                   0.1 product's leftover removed. Weight in vs final size × produced: over the limit,
+//                                   or a source type not clear (unknownTypes), blocks setup and produce.
 //   /soapops?type=Name                          the fields of one SOAP data type and their types (read-only)
 //   /cachecheck                                 whether the worker's saved-step memory works on this address (read-only)
 //   /assemblediag[?part=calls|send|stock|rest&sku=FINAL&fromBin=&toBin=] read-only assemble checks, one light part per call                 read-only: every Sellercloud assemble call and its fields, kit part fields,
@@ -1421,6 +1428,12 @@ async function assembleKit(env, body) {
     if (!(r.length === 1 && r[0].sku.toLowerCase() === want && Math.abs((r[0].recipePerKit ?? r[0].perKit) - per) < 0.0005))
       throw new HttpError(409, `${sku}'s kit in Sellercloud isn't ${body.source} × ${body.perKit} per kit, so I didn't assemble. Set up the kit again first.`);
   }
+  // A mix (several 0.1 products): the recipe must be exactly this run's lines.
+  if (Array.isArray(body.expectParts)) {
+    const r = pre.parts, w = body.expectParts;
+    const same = r.length === w.length && w.every((x) => r.some((p) => p.sku.toLowerCase() === String(x.sku).toLowerCase() && Math.abs((p.recipePerKit ?? p.perKit) - Number(x.perKit)) < 0.0005));
+    if (!same) throw new HttpError(409, `${sku}'s kit in Sellercloud isn't ${w.map((x) => `${x.perKit} ${x.sku}`).join(" + ")} per kit, so I didn't assemble. Run the setup again first.`);
+  }
   // Lock this production before the call, so a double click can't assemble twice.
   // Parts are counted in the From bin when it can be read (the warehouse total can lag behind it), else by total.
   const partsBy = pre.parts.every((p) => p.inFromBin != null) ? "bin" : "total";
@@ -1999,34 +2012,9 @@ async function putBackChecked(env, sku, bins, reason) {
   return { ...back, unclear: false };
 }
 
-// A production that has started keeps the per-kit number it was planned with (saved with its groups), so the
-// kit recipe isn't changed again from a bin that has already been broken down or assembled.
-async function withRunPer(body) {
-  const itemId = String(body?.itemId || "").trim();
-  if (!itemId || !RUN_KV) return body;
-  const out = { ...body };
-  const dis = await durable.match(lockKey("disrec", itemId)).catch(() => null);
-  if (dis) { try { const d = JSON.parse(await dis.text()); if (d && d.units > 0) out.runDis = d; } catch {} }
-  const hit = await durable.match(lockKey("groups", itemId)).catch(() => null);
-  if (hit) { try { const g = JSON.parse(await hit.text()); if (Array.isArray(g) && g.length === 1 && g[0].perKit > 0) out.runPerKit = g[0].perKit; } catch {} }
-  return out;
-}
-async function setupProduction(env, body) {
-  if (!RUN_KV) throw needKv();
-  // One setup call at a time per final kit, so two quick presses can't both empty the source.
-  const key = String(body.final || body.source || "").trim();
-  if (key && (await isLocked("setupcall", key))) return { saved: false, continue: true, message: "Still working on the last step.", state: body.state || {} };
-  if (key) await lock("setupcall", key, 60);
-  try { return await setupStep(env, await withRunPer(body)); } finally { if (key) await unlock("setupcall", key); }
-}
-async function setupStep(env, body) {
-  if (!assembleOn(env)) throw new HttpError(403, "Sellercloud writes are switched off. They turn on once ASSEMBLE_ENABLED is set to yes.");
-  const state = {};   // records changed in this call, echoed to the Hub
-  const sourceSku = String(body.source || "").trim();
-  const tag = `monday item ${String(body.itemId || "").slice(0, 40) || "?"}`;
-  const reply = (r) => ({ ...r, state: mergeState(body.state, state) });
-
-  // 1. The source was emptied to make it a kit: carry that on until its stock is back.
+// A source emptied to make it a kit: carry that on until its stock is back. null when nothing is in progress.
+// wantOf() gives the source's kit ({sku, perKit}) from the current plan.
+async function continueZeroed(env, sourceSku, body, state, reply, tag, wantOf) {
   const zeroed = sourceSku ? await recGet("zeroed", sourceSku, body) : null;
   if (zeroed && Array.isArray(zeroed.bins)) {
     const job = await recGet("kitjob", sourceSku, body);
@@ -2056,10 +2044,9 @@ async function setupStep(env, body) {
           return finish({ saved: false, error: `Sellercloud still showed ${sourceSku} with stock after emptying (${left.map((w) => `${w.name || "warehouse " + w.id}: physical ${w.physical}, available ${w.available}`).join("; ")}), so I didn't set the kit. Its stock was put back.` });
         return reply({ saved: false, continue: true, message: `Emptied ${sourceSku}. Waiting for Sellercloud to show it at 0.` });
       }
-      const plan = await productionPlan(env, body);
-      const st = plan.steps.find((x) => x.step === "source kit");
-      if (!st?.want) return finish({ saved: false, error: `Couldn't tell what ${sourceSku}'s kit should be. Its stock was put back.` });
-      const r = { kit: sourceSku, part: st.want.sku, perKit: st.want.perKit };
+      const w = await wantOf();
+      if (!w) return finish({ saved: false, error: `Couldn't tell what ${sourceSku}'s kit should be. Its stock was put back.` });
+      const r = { kit: sourceSku, part: w.sku, perKit: w.perKit };
       const sent = await sendKit(env, r);
       if (sent.error) return finish({ saved: false, error: `Setting ${sourceSku}: ${sent.error} Its stock was put back.` });
       await recSet("kitjob", sourceSku, { jobId: sent.jobId, at: Date.now(), part: r.part, perKit: r.perKit }, state);
@@ -2071,6 +2058,484 @@ async function setupStep(env, body) {
     if (Date.now() - (job.at || 0) < KIT_WAIT_MS) return reply({ saved: false, continue: true, message: `Waiting for Sellercloud to show ${sourceSku}'s kit.` });
     return finish({ saved: false, pending: true, message: `Sellercloud hadn't shown ${sourceSku}'s kit after 2 minutes, so its stock was put back.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""} Check its Kit tab in a minute, then press Run again; finished steps are skipped.` });
   }
+  return null;
+}
+
+// A production that has started keeps the per-kit number it was planned with (saved with its groups), so the
+// kit recipe isn't changed again from a bin that has already been broken down or assembled.
+async function withRunPer(body) {
+  const itemId = String(body?.itemId || "").trim();
+  if (!itemId || !RUN_KV) return body;
+  const out = { ...body };
+  const dis = await durable.match(lockKey("disrec", itemId)).catch(() => null);
+  if (dis) { try { const d = JSON.parse(await dis.text()); if (d && d.units > 0) out.runDis = d; } catch {} }
+  const hit = await durable.match(lockKey("groups", itemId)).catch(() => null);
+  if (hit) { try { const g = JSON.parse(await hit.text()); if (Array.isArray(g) && g.length === 1 && g[0].perKit > 0) out.runPerKit = g[0].perKit; } catch {} }
+  return out;
+}
+// ---- Mix kits (Shragy, Nov 19): one final kit made from several source products. -------------------------------
+// Same rules as a single kit, per product: each source breaks down into its own 0.1 product in the 0.1 bin; per kit
+// for that 0.1 product = this run's units of it ÷ qty produced, rounded down; the final's recipe gets one line per
+// 0.1 product, set to those real numbers before the run; ONE assembly (sent as the run total) into the To bin; each
+// 0.1 product's leftover is removed afterwards with one adjustment naming the run. Only this run's 0.1 units count.
+// Weight check before Run (his words: "if we use 10 pounds to create 400 1 pounders that is obviusly not making
+// sense"): weight in = each source's bin qty × its weight (bulk by lb: 1 unit = 1 lb; others: the oz in the SKU or
+// name), weight out = the final's size × qty produced; more than maxDiffPct (default 10) apart blocks, no override.
+// A source whose type isn't clear blocks until the Hub sends it (types), picked by the person assembling.
+// Mix mode only when `sources` holds 2 or more SKUs; single kits are untouched.
+function listParam(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  const t = String(v ?? "").trim();
+  if (!t) return [];
+  if (t.startsWith("[")) { try { return listParam(JSON.parse(t)); } catch { /* fall through */ } }
+  return t.split(",").map((x) => x.trim()).filter(Boolean);
+}
+// types: {"SKU": "lb"|"oz"|"10oz"} or "SKU1:lb,SKU2:oz" (split at each entry's last colon). Keys compared lower-case.
+function typesParam(v) {
+  let obj = {};
+  if (v && typeof v === "object" && !Array.isArray(v)) obj = v;
+  else {
+    const t = String(v ?? "").trim();
+    if (t.startsWith("{")) { try { obj = JSON.parse(t) || {}; } catch { obj = {}; } }
+    else for (const e of t.split(",")) { const i = e.lastIndexOf(":"); if (i > 0) obj[e.slice(0, i).trim()] = e.slice(i + 1).trim(); }
+  }
+  const out = {};
+  for (const [k, val] of Object.entries(obj)) if (k && val != null && String(val).trim()) out[k.toLowerCase()] = String(val).trim();
+  return out;
+}
+const isMix = (q) => listParam(q?.sources).length >= 2;
+// What one unit of a source weighs: { type: "lb"|"oz"|"unknown", from, unitsPer (0.1 units in one), ozPer, size }.
+function sourceKind(sku, name, given) {
+  const t = `${sku} ${name || ""}`;
+  const named = sizeFromName(sku) || sizeFromName(name);
+  if (given) {
+    if (/^lbs?$/i.test(given)) return { type: "lb", from: "picked", unitsPer: 160, ozPer: 16, size: "1 lb" };
+    if (/^oz$/i.test(given)) return named && named.whole
+      ? { type: "oz", from: "picked", unitsPer: named.units, ozPer: named.oz, size: named.text }
+      : { type: "oz", from: "picked", unitsPer: null, ozPer: null, size: null, needSize: true };
+    const z = sizeTyped(given);
+    if (z && z.whole) return { type: "oz", from: "picked", unitsPer: z.units, ozPer: z.oz, size: z.text };
+  }
+  if (isByPound(t)) return { type: "lb", from: "name", unitsPer: 160, ozPer: 16, size: "1 lb" };
+  const bulk = /\bbulk\b/i.test(t), lbWord = /(^|[^\d.\s])\s*\blbs?\b/i.test(t) && !named;
+  if (!named && (bulk || lbWord)) return { type: "lb", from: "name", unitsPer: 160, ozPer: 16, size: "1 lb" };
+  if (named && !bulk) return named.whole
+    ? { type: "oz", from: "name", unitsPer: named.units, ozPer: named.oz, size: named.text }
+    : { type: "unknown", from: null, unitsPer: null, ozPer: null, size: named.text };
+  return { type: "unknown", from: null, unitsPer: null, ozPer: null, size: named ? named.text : null };
+}
+// The 0.1 product of one source: its own kit part first, then a name match, else a new one to create.
+async function mixBridge(env, sourceSku, source) {
+  const br = await bridgeFor(env, sourceSku);
+  const kitBridge = br.bridgeInKit.length === 1 && source.components.length === 1 ? br.bridgeInKit[0] : null;
+  if (kitBridge) return { bridge: { sku: kitBridge.sku, name: kitBridge.name }, state: "found (source's kit part)", kitBridge, br };
+  const matches = br.bridgeCandidates.filter((c) => bridgeMatch(br.searchedFor, c));
+  if (matches.length === 1) return { bridge: matches[0], state: "found (name match)", kitBridge: null, br };
+  if (matches.length > 1) return { bridge: null, state: "unsure: more than one match", problem: `More than one 0.1 product could be ${sourceSku}'s: ${matches.map((m) => m.sku).join(", ")}.`, br };
+  const newSku = newBridgeSku(br.searchedFor || sourceSku);
+  if (!newSku) return { bridge: null, state: "unsure", problem: `Couldn't make a 0.1 SKU from ${source.name || sourceSku}.`, br };
+  if (await findProduct(env, newSku)) return { bridge: null, state: "unsure: SKU taken", problem: `${newSku} already exists in Sellercloud but doesn't look like ${sourceSku}'s 0.1 product. Check it.`, br };
+  return { bridge: { sku: newSku, name: newSku, isNew: true }, state: "to create", kitBridge: null, br };
+}
+const mixKey = (itemId, x) => `${itemId}|${String(x).toLowerCase()}`;
+async function readRec(kind, id) {
+  const h = await durable.match(lockKey(kind, id)).catch(() => null);
+  if (!h) return null;
+  try { return JSON.parse(await h.text()); } catch { return null; }
+}
+const putRec = (kind, id, val) => durable.put(lockKey(kind, id), new Response(JSON.stringify(val), { headers: { "cache-control": "max-age=2592000" } }));
+// A started mix run: its saved parts (per-kit numbers) and each source's break-down record.
+async function withMixRun(q) {
+  const itemId = String(q?.itemId || "").trim();
+  if (!itemId || !RUN_KV) return q;
+  const run = await readRec("mixrun", itemId);
+  if (!run) return q;
+  const dis = {};
+  for (const s of run.sources || []) { const d = await readRec("disrec", mixKey(itemId, s.sku)); if (d) dis[s.sku.toLowerCase()] = d; }
+  return { ...q, mixRun: run, mixDis: dis };
+}
+
+async function mixPlan(env, q) {
+  needCompany(env);
+  const skus = listParam(q.sources), finalSku = String(q.final || "").trim(), fromBin = String(q.fromBin || "").trim();
+  const produced = Number(q.produced), types = typesParam(q.types);
+  if (skus.length < 2) throw new HttpError(400, "sources needs 2 or more SKUs for a mix.");
+  if (new Set(skus.map((x) => x.toLowerCase())).size !== skus.length) throw new HttpError(400, "A SKU is listed twice in sources.");
+  if (!finalSku) throw new HttpError(400, "final (the final listing's SKU) is needed.");
+  if (skus.some((x) => x.toLowerCase() === finalSku.toLowerCase())) throw new HttpError(400, "The final listing can't also be a source.");
+  if (!Number.isInteger(produced) || produced < 1) throw new HttpError(400, "produced must be a whole number, 1 or more.");
+  const maxPct = Math.max(1, Number(q.maxDiffPct) || Number(env.PRODUCE_MAX_DIFF_PCT || 10) || 10);
+  const bBin = bridgeBinName(env), run = q.mixRun || null, dis = q.mixDis || {};
+  const problems = [], steps = [], sources = [], unknownTypes = [];
+  if (!fromBin) problems.push("Pick the From bin.");
+
+  const final = await kitDefinition(env, finalSku);
+  if (!final.exists) problems.push(`${finalSku} isn't a product in Sellercloud. Create it there first.`);
+  else if (final.sellercloudSaid && !/is not a kit/i.test(final.sellercloudSaid)) problems.push(`Couldn't read ${finalSku}'s kit parts from Sellercloud (${final.sellercloudSaid}). Try again in a minute.`);
+  const finalSize = sizeTyped(q.finalSize) || sizeFromName(finalSku) || sizeFromName(final.name);
+  if (!finalSize) problems.push(`Size not clear for ${finalSku}. Enter the size.`);
+
+  for (const sku of skus) {
+    const src = await kitDefinition(env, sku);
+    if (!src.exists) { problems.push(`No product with SKU ${sku} in Sellercloud.`); sources.push({ sku, exists: false, type: "unknown" }); continue; }
+    if (src.sellercloudSaid && !/is not a kit/i.test(src.sellercloudSaid)) problems.push(`Couldn't read ${sku}'s kit parts from Sellercloud (${src.sellercloudSaid}). Try again in a minute.`);
+    const b = await mixBridge(env, sku, src);
+    if (b.problem) problems.push(b.problem);
+    const kind = sourceKind(sku, src.name, types[sku.toLowerCase()]);
+    // An existing kit of its 0.1 product says how many units one holds; a type picked or read from the name must agree.
+    let unitsPer = kind.unitsPer, type = kind.type;
+    if (b.kitBridge) {
+      if (unitsPer != null && unitsPer !== b.kitBridge.perKit)
+        problems.push(`${sku} is a kit of ${b.kitBridge.perKit} × ${b.kitBridge.sku} in Sellercloud (${b.kitBridge.perKit / 10} oz), but its ${kind.from === "picked" ? "picked type" : "name"} says ${kind.size} (${unitsPer} units). Check which is right.`);
+      unitsPer = b.kitBridge.perKit;
+      if (type === "unknown") type = "kit";
+    } else if (src.components.length) problems.push(`${sku} is already a kit of ${src.components.map((c) => `${c.sku} × ${c.perKit}`).join(", ")}, not of a 0.1 product.`);
+    if (type === "unknown" || unitsPer == null) {
+      unknownTypes.push(sku);
+      problems.push(kind.needSize ? `Size not clear for ${sku}. Enter its size in oz.` : `Type not clear for ${sku}: pick bulk by lb or oz.`);
+    }
+    // This run's units: its saved break-down once it has run, else what's in the From bin now.
+    const d = dis[sku.toLowerCase()];
+    let binQty = null;
+    if (fromBin) binQty = ((await productBins(env, sku)).bins.find((x) => x.bin.toLowerCase() === fromBin.toLowerCase()) || {}).qty || 0;
+    if (fromBin && !d && !(binQty > 0)) problems.push(`Bin ${fromBin} has no ${sku}.`);
+    const qty = d ? d.qty : binQty;
+    const units = d ? d.units : qty != null && unitsPer != null ? qty * unitsPer : null;
+    sources.push({ sku, name: src.name, exists: true, type, typeFrom: b.kitBridge && kind.type === "unknown" ? "kit" : kind.from, size: kind.size,
+      unitsPer, bridge: b.bridge, bridgeState: b.state, binQty: qty, units, weightOz: units != null ? round3(units / 10) : null, brokenDown: !!d });
+
+    steps.push({ step: "0.1 product", sku, state: b.state, bridgeSku: b.bridge?.sku ?? null, name: b.bridge?.name ?? null,
+      summary: b.bridge ? (b.state === "to create" ? `Create ${b.bridge.sku}.` : `${sku}'s 0.1 product is ${b.bridge.sku}.`) : null });
+    const kitToSet = !b.kitBridge && !src.components.length;
+    let stock = null;
+    if (kitToSet && !d) {
+      stock = await sourceStock(env, sku);
+      if (stock.problem) problems.push(stock.problem);
+      else if (stock.bins.length) steps.push({ step: "empty source", sku, bins: stock.bins, total: stock.total, warehouse: assembleWarehouse(env),
+        summary: `Take ${stock.total} ${sku} out of ${stock.bins.map((e) => "bin " + e.bin).join(", ")} to set its kit; put back right after.` });
+    }
+    steps.push({ step: "source kit", sku, state: b.kitBridge ? "ready" : src.components.length ? "different" : "to set", current: src.components,
+      want: unitsPer != null && b.bridge ? { sku: b.bridge.sku, perKit: unitsPer } : null,
+      summary: b.kitBridge ? `${sku} is a kit of ${b.kitBridge.perKit} × ${b.kitBridge.sku}.` : unitsPer != null && b.bridge ? `Set ${sku} as a kit of ${unitsPer} × ${b.bridge.sku}.` : null });
+    if (stock && !stock.problem && stock.bins.length)
+      steps.push({ step: "put back source", sku, bins: stock.bins, total: stock.total, warehouse: assembleWarehouse(env), summary: `Put the ${stock.total} ${sku} back.` });
+    steps.push(d
+      ? { step: "disassemble", sku, qty: d.qty, from: sku, unitsOut: d.units, into: bBin, done: true, summary: `Broke down ${d.qty} ${sku} into ${d.units} units of ${d.bridge} in bin ${bBin}.` }
+      : { step: "disassemble", sku, qty: binQty, from: sku, unitsOut: units, into: bBin,
+          summary: binQty > 0 && units != null && b.bridge ? `Break down ${binQty} ${sku} from bin ${fromBin} into ${units} units of ${b.bridge.sku} in bin ${bBin}.` : null });
+  }
+
+  // Weight check: in = this run's sources, out = final size × qty produced.
+  const known = sources.every((x) => x.weightOz != null);
+  const inOz = known ? round3(sources.reduce((t, x) => t + x.weightOz, 0)) : null;
+  const outOz = finalSize ? round3(finalSize.oz * produced) : null;
+  const diffPct = inOz != null && outOz ? Math.round(Math.abs(inOz - outOz) / outOz * 1000) / 10 : null;
+  const weight = { inOz, outOz, inLb: inOz != null ? round3(inOz / 16) : null, outLb: outOz != null ? round3(outOz / 16) : null, diffPct, maxPct, ok: diffPct != null && diffPct <= maxPct };
+  if (diffPct != null && diffPct > maxPct)
+    problems.push(`The weight doesn't add up: ${weight.inLb} lb goes in (${sources.map((x) => `${x.sku} ${round3(x.weightOz / 16)} lb`).join(", ")}), but ${produced} × ${finalSize.text} is ${weight.outLb} lb, ${diffPct}% off. More than ${maxPct}% off blocks. Check the qty produced and the bins.`);
+
+  // One recipe line per 0.1 product (two sources with the same 0.1 product share a line).
+  const byBridge = new Map();
+  for (const x of sources) if (x.bridge && x.units != null) {
+    const k = x.bridge.sku.toLowerCase();
+    const e = byBridge.get(k) || { sku: x.bridge.sku, units: 0, sources: [] };
+    e.units += x.units; e.sources.push(x.sku); byBridge.set(k, e);
+  }
+  const savedPer = new Map((run?.parts || []).map((p) => [p.sku.toLowerCase(), p]));
+  const parts = [...byBridge.values()].map((e) => {
+    const sp = savedPer.get(e.sku.toLowerCase());
+    const perKit = sp ? sp.perKit : Math.floor(e.units / produced);
+    const leftover = sp ? sp.leftover : e.units - perKit * produced;
+    return { sku: e.sku, sources: e.sources, units: sp ? sp.units : e.units, perKit, leftover };
+  });
+  for (const pt of parts) if (!(pt.perKit >= 1)) problems.push(`${pt.units} units of ${pt.sku} aren't enough for ${produced} kits.`);
+  const allParts = known && sources.every((x) => x.bridge) && parts.length > 0;
+
+  // The final's recipe: one line per 0.1 product at this run's real per kit.
+  const fc = final.components || [];
+  const want = allParts ? parts.map((pt) => ({ sku: pt.sku, perKit: pt.perKit })) : null;
+  const sameSet = want && fc.length === want.length && want.every((w) => fc.some((c) => c.sku.toLowerCase() === w.sku.toLowerCase()));
+  const fState = !want ? (fc.length ? "different" : "to set") : sameSet
+    ? (want.every((w) => fc.find((c) => c.sku.toLowerCase() === w.sku.toLowerCase()).perKit === w.perKit) ? "ready" : "to change")
+    : fc.length ? "different" : "to set";
+  if (fState === "different" && want) problems.push(`${finalSku} is already a kit of ${fc.map((c) => `${c.sku} × ${c.perKit}`).join(", ")}, not of this mix's 0.1 products. Change its Kit tab first.`);
+  const recipeText = (list) => list.map((w) => `${w.perKit} ${w.sku}`).join(" + ");
+  steps.push({ step: "final kit", sku: finalSku, state: fState, current: fc, want: want ? { parts: want } : null, size: finalSize,
+    recipeFrom: fState === "to change" ? fc.map((c) => ({ sku: c.sku, perKit: c.perKit })) : null, recipeTo: fState === "to change" ? want : null,
+    summary: !want ? null : fState === "ready" ? `Kit recipe already ${recipeText(want)} per kit.`
+      : fState === "to change" ? `Set kit recipe ${recipeText(fc)} → ${recipeText(want)} per kit.`
+      : fState === "to set" ? `Set the kit recipe to ${recipeText(want)} per kit.` : null });
+  steps.push({ step: "assemble", sku: finalSku, qty: produced, fromBin: bBin, parts: allParts ? parts : null,
+    summary: allParts ? `${produced} kits × (${recipeText(parts)}), one assembly from bin ${bBin}.` : null });
+  for (const pt of parts) if (pt.leftover > 0)
+    steps.push({ step: "empty leftover", sku: pt.sku, bin: bBin, qty: pt.leftover,
+      summary: `Remove this run's ${pt.leftover} leftover ${pt.sku} from bin ${bBin} after assembling (adjustment, reason names the run); other stock in the bin stays.` });
+
+  if (produced > assembleMax(env)) problems.push(`At most ${assembleMax(env)} kit${assembleMax(env) === 1 ? "" : "s"} per press for now.`);
+  for (const st of steps) st.action = actionFor(st);
+  return { mode: "mix", source: null, sources, final: { sku: finalSku, name: final.name, size: finalSize }, parts, recipe: want,
+    weight, unknownTypes, perFinal: null, fromBin: fromBin || null, bridgeBin: bBin, produced, steps, problems,
+    ok: problems.length === 0 && unknownTypes.length === 0, assemblyOn: assembleOn(env), maxQty: assembleMax(env) };
+}
+
+// Several kit lines in one Kits import (the final's recipe). { jobId } or { error }.
+async function sendKitRows(env, rows, overwrite) {
+  const res = await scPost(env, "/Catalog/Imports/Kits", {
+    Format: 1, FileContents: b64(kitCsv(rows)), FileExtension: ".csv", Metadata: { OverwriteExistingKits: !!overwrite },
+  });
+  const jobId = importJobId(res);
+  if (!jobId) return { jobId: null };
+  await sleep(2000);
+  const j = await kitJob(env, jobId).catch(() => ({}));
+  if (j.error) return { jobId, error: `Sellercloud said: ${String(j.error).slice(0, 300)}` };
+  return { jobId };
+}
+
+// Setup for a mix: one write per call, in order: each 0.1 product, each source kit (emptied and put back if it has
+// stock), then the final's recipe. Same records and waits as a single kit.
+async function mixSetupStep(env, body) {
+  if (!assembleOn(env)) throw new HttpError(403, "Sellercloud writes are switched off. They turn on once ASSEMBLE_ENABLED is set to yes.");
+  const state = {};
+  const tag = `monday item ${String(body.itemId || "").slice(0, 40) || "?"}`;
+  const reply = (r) => ({ ...r, state: mergeState(body.state, state) });
+  const skus = listParam(body.sources);
+  // A source emptied for its kit: finish that first.
+  for (const sku of skus) {
+    const cz = await continueZeroed(env, sku, body, state, reply, tag, async () => {
+      const plan = await mixPlan(env, body);
+      return plan.steps.find((x) => x.step === "source kit" && x.sku.toLowerCase() === sku.toLowerCase())?.want || null;
+    });
+    if (cz) return cz;
+  }
+  const plan = await mixPlan(env, body);
+  const blocking = plan.problems.filter((p) => !/^Bin .* has no |^Pick the From bin|aren't enough for|^At most \d+ kit/.test(p));
+  if (blocking.length) return reply({ saved: false, error: blocking.join(" "), plan });
+  if (plan.unknownTypes.length) return reply({ saved: false, error: `Pick bulk by lb or oz for ${plan.unknownTypes.join(", ")} first.`, plan });
+  const kitOf = (x) => x.step === "final kit" ? plan.final.sku : x.sku;
+  // Kits already sent: wait for them to show.
+  for (const x of plan.steps.filter((y) => (y.step === "source kit" || y.step === "final kit") && y.action === "set")) {
+    const kit = kitOf(x);
+    const job = await recGet("kitjob", kit, body);
+    if (!job) continue;
+    const j = job.jobId ? await kitJob(env, job.jobId).catch(() => ({})) : {};
+    if (j.error) { await recDel("kitjob", kit, state); return reply({ saved: false, error: `Setting ${kit}: Sellercloud said: ${String(j.error).slice(0, 300)}`, plan }); }
+    if (Date.now() - (job.at || 0) < KIT_WAIT_MS) return reply({ saved: false, continue: true, message: `Waiting for Sellercloud to show ${kit}'s kit.`, plan });
+    if (x.step === "final kit" && x.state === "to change" && job.overwrite && !job.retried && x.want) {
+      const rows = x.want.parts.map((w) => ({ kit, part: w.sku, perKit: w.perKit }));
+      const sent2 = await sendKitRows(env, rows, false);
+      if (sent2.error) { await recDel("kitjob", kit, state); return reply({ saved: false, error: `Changing ${kit}'s recipe: ${sent2.error}`, plan }); }
+      await recSet("kitjob", kit, { jobId: sent2.jobId, at: Date.now(), parts: x.want.parts, overwrite: false, retried: true }, state);
+      return reply({ saved: false, continue: true, message: `Sellercloud hadn't shown ${kit}'s new recipe yet, so I sent it once more. Waiting for it to show.`, plan });
+    }
+    await recDel("kitjob", kit, state);
+    if (x.step === "final kit" && x.state === "to change")
+      return reply({ saved: false, error: `Sellercloud still doesn't show ${kit}'s new recipe after sending it twice. Nothing was broken down or assembled. You can change it in its Kit tab, then press Run again.`, plan });
+    return reply({ saved: false, pending: true, message: `Sellercloud hadn't shown ${kit}'s kit after 2 minutes.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""} Check its Kit tab in a minute, then press Run again.`, plan });
+  }
+  for (const x of plan.steps.filter((y) => (y.step === "source kit" || y.step === "final kit") && y.action === "skip"))
+    if (await recGet("kitjob", kitOf(x), body)) await recDel("kitjob", kitOf(x), state);
+  const todo = plan.steps.filter((x) => ["create", "set"].includes(x.action));
+  if (!todo.length) return reply({ saved: true, unchanged: true, message: "Everything is set up in Sellercloud.", plan });
+
+  // 1. A missing 0.1 product.
+  const b = plan.steps.find((x) => x.step === "0.1 product" && x.action === "create");
+  if (b) {
+    const src = plan.sources.find((x) => x.sku === b.sku);
+    const type = src ? (await kitDefinition(env, src.sku)).productType : null;
+    if (!type) return reply({ saved: false, error: `Couldn't tell ${b.sku}'s product type, so I didn't create its 0.1 product.`, plan });
+    if (!(await findProduct(env, b.bridgeSku))) {
+      if (await isLocked("creating", b.bridgeSku)) return reply({ saved: false, continue: true, message: `Waiting for Sellercloud to show ${b.bridgeSku}.`, plan });
+      await lock("creating", b.bridgeSku, 120);
+      await scPost(env, "/Products", { CompanyId: warehouseCompanyId(env) || 317, ProductSKU: b.bridgeSku, ProductName: b.bridgeSku, ProductTypeName: type });
+    }
+    return reply({ saved: false, continue: true, message: `Created ${b.bridgeSku}.`, plan });
+  }
+  // 2. A source kit (emptied first when it has stock; Sellercloud won't make a stocked product a kit).
+  const sk = plan.steps.find((x) => x.step === "source kit" && x.action === "set");
+  if (sk) {
+    if (!sk.want || !Number.isInteger(sk.want.perKit) || sk.want.perKit < 1) return reply({ saved: false, error: `Couldn't tell what ${sk.sku}'s kit should be.`, plan });
+    const r = { kit: sk.sku, part: sk.want.sku, perKit: sk.want.perKit };
+    const emptyStep = plan.steps.find((x) => x.step === "empty source" && x.sku === sk.sku);
+    if (emptyStep) {
+      await recSet("zeroed", r.kit, { bins: emptyStep.bins, at: Date.now() }, state);
+      for (const e of emptyStep.bins) {
+        const a = await adjustBinBy(env, r.kit, e.bin, -e.qty, `Emptied to set ${r.kit} up as a kit of ${r.part}; put back right after (${tag})`, 1);
+        if (a.error) {
+          const back = await putBackChecked(env, r.kit, emptyStep.bins, `Put back after a failed empty of ${r.kit} (${tag})`);
+          if (back.failed.length) return reply({ saved: false, critical: true, error: `IMPORTANT: emptying ${r.kit} failed part way and it isn't back in full. Put back by hand: ${back.failed.map((f) => `bin ${f.bin} should have ${f.qty}, shows ${f.now}`).join(", ")}.`, plan });
+          await recDel("zeroed", r.kit, state);
+          return reply({ saved: false, error: `Couldn't empty ${r.kit} in bin ${e.bin}: ${a.error}`, plan });
+        }
+      }
+      return reply({ saved: false, continue: true, message: `Took ${emptyStep.total} of ${r.kit} out of ${emptyStep.bins.map((e) => "bin " + e.bin).join(", ")} to set its kit. It goes back right after.`, plan });
+    }
+    const sent = await sendKit(env, r, false);
+    if (sent.error) return reply({ saved: false, error: `Setting ${r.kit}: ${sent.error}`, plan });
+    await recSet("kitjob", r.kit, { jobId: sent.jobId, at: Date.now(), part: r.part, perKit: r.perKit }, state);
+    return reply({ saved: false, continue: true, message: `Sent ${r.kit}'s kit to Sellercloud. Waiting for it to show.`, plan });
+  }
+  // 3. The final's recipe, one line per 0.1 product.
+  const fk = plan.steps.find((x) => x.step === "final kit" && x.action === "set");
+  if (fk) {
+    if (!fk.want || fk.want.parts.some((w) => !Number.isInteger(w.perKit) || w.perKit < 1)) return reply({ saved: false, error: "A kit qty isn't a whole number.", plan });
+    const kit = plan.final.sku, change = fk.state === "to change";
+    const sent = await sendKitRows(env, fk.want.parts.map((w) => ({ kit, part: w.sku, perKit: w.perKit })), change);
+    if (sent.error) return reply({ saved: false, error: `${change ? "Changing" : "Setting"} ${kit}'s recipe: ${sent.error}`, plan });
+    await recSet("kitjob", kit, { jobId: sent.jobId, at: Date.now(), parts: fk.want.parts, overwrite: change }, state);
+    return reply({ saved: false, continue: true, message: `Sent ${kit}'s ${change ? "new " : ""}recipe to Sellercloud (${fk.summary.replace(/^Set (the )?kit recipe (to )?/, "").replace(/\.$/, "")}). Waiting for it to show.`, plan });
+  }
+  return reply({ saved: false, error: "Nothing left I can set up; check the plan.", plan });
+}
+
+// Produce for a mix: break down each source into the 0.1 bin (one record each), then ONE assembly of the final with
+// the recipe's per-kit numbers (sent as run totals), then each 0.1 product's leftover removed. Records as single kits.
+async function mixProduce(env, body) {
+  if (!assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off. It turns on once ASSEMBLE_ENABLED is set to yes.");
+  if (!RUN_KV) throw needKv();
+  const skus = listParam(body.sources);
+  for (const sku of skus) if (await durable.match(lockKey("zeroed", sku)))
+    return { done: false, status: "failed", message: `${sku} was emptied for its kit setup and not put back yet. Press Run on the setup again first.` };
+  const itemId = String(body.itemId || "").trim();
+  if (!itemId) throw new HttpError(400, "itemId (the monday item) is needed so a production only runs once.");
+  const fromBin = await realBin(env, binName(body.fromBin), "From"), toBin = await realBin(env, binName(body.toBin), "To");
+  const plan = await mixPlan(env, await withMixRun({ ...body, fromBin }));
+  const bBin = await realBin(env, plan.bridgeBin, "0.1");
+  const notReady = plan.steps.filter((s) => ["create", "set", "stop"].includes(s.action));
+  if (notReady.length) {
+    const ch = notReady.find((s) => s.step === "final kit" && s.state === "to change");
+    throw new HttpError(409, ch && notReady.length === 1
+      ? `${plan.final.sku}'s kit recipe isn't this run's numbers yet (${ch.summary}), so nothing was assembled. Run the setup again first; it changes the recipe.`
+      : "Set up the 0.1 products and kits first.");
+  }
+  let run = await readRec("mixrun", itemId);
+  const asmState = await confirmAsm(env, itemId);
+  if (asmState.state === "pending") return { done: false, continue: true, status: "assemble not confirmed", message: asmState.message };
+  if (asmState.state === "bad") return { done: false, status: "partly changed", message: asmState.message };
+  const assembled = asmState.state === "confirmed";
+  if (!run) {
+    if (assembled) return { done: false, status: "no break-down record", message: `${plan.final.sku} was assembled for this item, but there's no record of the mix run. Check Sellercloud, then clear and run again.` };
+    if (!plan.ok) throw new HttpError(409, [...plan.problems, ...(plan.unknownTypes.length ? [`Pick bulk by lb or oz for ${plan.unknownTypes.join(", ")}.`] : [])].join(" "));
+    run = { produced: plan.produced, final: plan.final.sku, at: Date.now(),
+      sources: plan.sources.map((x) => ({ sku: x.sku, bridge: x.bridge.sku, qty: x.binQty, unitsPer: x.unitsPer, units: x.units })),
+      parts: plan.parts.map((pt) => ({ sku: pt.sku, units: pt.units, perKit: pt.perKit, leftover: pt.leftover, sources: pt.sources })) };
+    await putRec("mixrun", itemId, run);
+  }
+  const breakdowns = [];
+  if (!assembled) {
+    // 1. Break down each source once, into the 0.1 bin. Each 0.1 product's bin qty is saved before its first break-down.
+    for (const s of run.sources) {
+      const dKey = mixKey(itemId, s.sku);
+      const rec = await readRec("disrec", dKey);
+      if (rec) {
+        const srcNow = await binQtyOf(env, s.sku, fromBin);
+        if (!(rec.srcBefore - srcNow >= rec.qty))
+          return { done: false, continue: true, status: "waiting", message: `Sellercloud still shows ${srcNow} of ${s.sku} in bin ${fromBin} after the break-down of ${rec.qty}. Wait a minute, then press Run again.` };
+        continue;
+      }
+      if (await isLocked("disassembled", dKey))
+        return { done: false, status: "no break-down record", message: `${s.sku} was sent for break-down without a record of its 0.1 units, so I stopped. Check Sellercloud, then clear and run again.` };
+      if (timeUp()) return { done: false, continue: true, status: "breaking down", message: `Broke down ${breakdowns.length} so far. Carrying on.`, breakdowns };
+      const base = mixKey(itemId, "base:" + s.bridge);
+      if (!(await readRec("brbase", base))) await putRec("brbase", base, { qty: await binQtyOf(env, s.bridge, bBin), at: Date.now() });
+      const before = { src: await binQtyOf(env, s.sku, fromBin), br: await binQtyOf(env, s.bridge, bBin) };
+      if (before.src < s.qty) return { done: false, status: "numbers off", message: `Bin ${fromBin} now has ${before.src} of ${s.sku}, not the ${s.qty} this run was planned with. Nothing more was broken down. Check Sellercloud, then clear and run again.` };
+      await putRec("disrec", dKey, { qty: s.qty, units: s.qty * s.unitsPer, bridge: s.bridge, bin: bBin, fromBin, srcBefore: before.src, bridgeBefore: before.br, at: Date.now() });
+      await lock("disassembled", dKey, 0);
+      await lock("disassembled", itemId, 0); // the item-level flag the Hub reads (disassembleSent)
+      let err = null;
+      try {
+        await soapCall(env, SOAP_DISASSEMBLE,
+          `<KitParentProductID>${xmlEsc(s.sku)}</KitParentProductID>` +
+          `<QtyToDisAssemble>${s.qty}</QtyToDisAssemble>` +
+          `<DisAssembleIntoWarehouseID>${assembleWarehouse(env)}</DisAssembleIntoWarehouseID>` +
+          `<DestinationBinName>${xmlEsc(bBin)}</DestinationBinName>` +
+          `<OriginalBinName>${xmlEsc(fromBin)}</OriginalBinName>` +
+          (await expiryXml(env, SOAP_DISASSEMBLE)));
+      } catch (e) { err = e.message || String(e); }
+      let after, moved = false, nothing = true;
+      for (let i = 0; i < 16; i++) {
+        after = { src: await binQtyOf(env, s.sku, fromBin), br: await binQtyOf(env, s.bridge, bBin) };
+        moved = before.src - after.src === s.qty && after.br - before.br === s.qty * s.unitsPer;
+        nothing = before.src === after.src && before.br === after.br;
+        if (moved || (err && i >= 1) || timeUp()) break;
+        await sleep(4000);
+      }
+      breakdowns.push({ sku: s.sku, qty: s.qty, units: s.qty * s.unitsPer, srcBefore: before.src, srcAfter: after.src, bridgeBefore: before.br, bridgeAfter: after.br, error: err });
+      if (!moved) return { done: false, continue: !(nothing && err), status: nothing && err ? "disassemble failed" : "disassemble not confirmed",
+        message: nothing && err ? `${s.sku} not broken down. ${err}` : `Sellercloud hasn't shown the break-down of ${s.sku} in bin ${bBin} yet. Wait a minute, then press Run again; it carries on from this run's records.`, breakdowns };
+    }
+    // 2. Wait for this run's units of each 0.1 product in the 0.1 bin (over what it held before), then ONE assembly.
+    for (const pt of run.parts) {
+      const base = await readRec("brbase", mixKey(itemId, "base:" + pt.sku));
+      if (!base) return { done: false, status: "no break-down record", message: `There's no record of what bin ${bBin} held of ${pt.sku} before this run, so I didn't assemble (it would mix in other stock). Check Sellercloud, then clear and run again.` };
+      const need = pt.perKit * run.produced;
+      let inBin = await binQtyOf(env, pt.sku, bBin);
+      for (let j = 0; j < 15 && inBin - base.qty < need && !timeUp(); j++) { await sleep(3000); inBin = await binQtyOf(env, pt.sku, bBin); }
+      if (inBin - base.qty < need)
+        return { done: false, continue: true, status: "waiting for parts", message: `Waiting for Sellercloud to show this run's ${pt.sku} units in bin ${bBin} (shows ${Math.max(0, inBin - base.qty)} of ${need}).`, breakdowns };
+    }
+    const asm = await assembleKit(env, { sku: plan.final.sku, qty: run.produced, itemId, fromBin: bBin, toBin,
+      expectParts: run.parts.map((pt) => ({ sku: pt.sku, perKit: pt.perKit })) });
+    if (!asm.done) return { done: false, continue: !!asm.continue, status: asm.status, message: asm.message, assemble: asm, breakdowns };
+  }
+  // 3. Each 0.1 product's leftover: only this run's, out of the 0.1 bin.
+  const removed = [];
+  for (const pt of run.parts) {
+    if (!(pt.leftover > 0)) continue;
+    const eKey = mixKey(itemId, pt.sku);
+    if (await isLocked("emptied", eKey)) continue;
+    if (!(pt.leftover < run.produced)) return { done: false, status: "leftover too big", message: `Assembled, but ${pt.leftover} units of ${pt.sku} are left, more than one per kit, so I didn't remove them. Check the counts.` };
+    const base = await readRec("brbase", mixKey(itemId, "base:" + pt.sku));
+    if (!base) return { done: false, status: "leftover not removed", message: `Assembled, but there's no record of what bin ${bBin} held of ${pt.sku} before this run, so I didn't remove its ${pt.leftover} leftover. Check Sellercloud.` };
+    const expect = base.qty + pt.leftover;
+    let before = await binQtyOf(env, pt.sku, bBin);
+    for (let i = 0; i < 15 && before !== expect && !timeUp(); i++) { await sleep(4000); before = await binQtyOf(env, pt.sku, bBin); }
+    if (before !== expect) return { done: false, continue: true, status: "leftover not found", message: `Assembled. Bin ${bBin} shows ${before} of ${pt.sku}, not the ${expect} expected (${base.qty} from before this run plus this run's ${pt.leftover} left over), so I didn't remove it yet. Wait a minute, then press Run again.`, removed };
+    await lock("emptied", eKey, 0);
+    await lock("emptied", itemId, 0); // the item-level flag the Hub reads (leftoverRemoved)
+    let err = null;
+    try {
+      await soapCall(env, SOAP_ADJUST,
+        `<ProductId>${xmlEsc(pt.sku)}</ProductId><BinName>${xmlEsc(bBin)}</BinName>` +
+        `<WarehouseID>${assembleWarehouse(env)}</WarehouseID><Qty>${-pt.leftover}</Qty>` +
+        `<reason>${xmlEsc(`Production leftover 0.1 after assembling ${run.produced} x ${plan.final.sku} (monday item ${itemId})`)}</reason>` +
+        `<SerialsList></SerialsList>${await expiryXml(env, SOAP_ADJUST)}<LotNumber></LotNumber>`);
+    } catch (e) { err = e.message || String(e); }
+    let after = await binQtyOf(env, pt.sku, bBin);
+    for (let i = 0; i < 15 && before - after !== pt.leftover && !err; i++) { await sleep(4000); after = await binQtyOf(env, pt.sku, bBin); }
+    const ok = before - after === pt.leftover;
+    removed.push({ sku: pt.sku, bin: bBin, qty: pt.leftover, binBefore: before, binAfter: after, ok, error: err });
+    if (!ok) return { done: false, status: before === after ? "leftover not removed" : "leftover not confirmed",
+      message: before === after ? `Assembled, but the ${pt.leftover} leftover ${pt.sku} weren't removed. ${err || ""}`.trim()
+        : `Assembled, but bin ${bBin} went from ${before} to ${after} for ${pt.sku} instead of down by ${pt.leftover}. Check Sellercloud.`, removed };
+  }
+  return { done: true, status: "assembled",
+    message: `Assembled ${run.produced} × ${plan.final.sku} from bin ${bBin} to bin ${toBin}: ${run.parts.map((pt) => `${pt.perKit} ${pt.sku}`).join(" + ")} per kit.` +
+      (removed.length ? ` Removed this run's leftover ${removed.map((r) => `${r.qty} ${r.sku}`).join(", ")} from bin ${bBin}.` : ""),
+    breakdowns, removed, parts: run.parts };
+}
+
+async function setupProduction(env, body) {
+  if (!RUN_KV) throw needKv();
+  // One setup call at a time per final kit, so two quick presses can't both empty the source.
+  const key = String(body.final || body.source || "").trim();
+  if (key && (await isLocked("setupcall", key))) return { saved: false, continue: true, message: "Still working on the last step.", state: body.state || {} };
+  if (key) await lock("setupcall", key, 60);
+  try { return isMix(body) ? await mixSetupStep(env, await withMixRun(body)) : await setupStep(env, await withRunPer(body)); } finally { if (key) await unlock("setupcall", key); }
+}
+async function setupStep(env, body) {
+  if (!assembleOn(env)) throw new HttpError(403, "Sellercloud writes are switched off. They turn on once ASSEMBLE_ENABLED is set to yes.");
+  const state = {};   // records changed in this call, echoed to the Hub
+  const sourceSku = String(body.source || "").trim();
+  const tag = `monday item ${String(body.itemId || "").slice(0, 40) || "?"}`;
+  const reply = (r) => ({ ...r, state: mergeState(body.state, state) });
+
+  // 1. The source was emptied to make it a kit: carry that on until its stock is back.
+  const cz = await continueZeroed(env, sourceSku, body, state, reply, tag, async () => {
+    const plan = await productionPlan(env, body);
+    return plan.steps.find((x) => x.step === "source kit")?.want || null;
+  });
+  if (cz) return cz;
 
   // 2. Nothing in progress for the source: work from the plan.
   const plan = await productionPlan(env, body);
@@ -2197,6 +2662,7 @@ async function confirmAsm(env, key) {
 async function produceProduction(env, body) {
   if (!assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off. It turns on once ASSEMBLE_ENABLED is set to yes.");
   if (!RUN_KV) throw needKv();
+  if (isMix(body)) return mixProduce(env, body);
   if (body.source && (await durable.match(lockKey("zeroed", String(body.source).trim()))))
     return { done: false, status: "failed", message: `${String(body.source).trim()} was emptied for its kit setup and not put back yet. Press Run on the setup again first.` };
   const itemId = String(body.itemId || "").trim();
@@ -2622,6 +3088,14 @@ async function handle(request, env) {
 
     case "/assemble/plan": {
       const g = (k) => (url.searchParams.get(k) || "").trim();
+      const srcs = url.searchParams.getAll("sources");
+      const mixQ = { sources: srcs.length > 1 ? srcs : srcs[0] || "", types: g("types"), maxDiffPct: g("maxDiffPct") };
+      if (isMix(mixQ)) {
+        const plan = await mixPlan(env, await withMixRun({ ...mixQ, final: g("final"), fromBin: g("fromBin"), produced: g("produced"),
+          finalSize: g("finalSize"), itemId: g("itemId") }));
+        plan.savedStepsWork = await cacheWorks();
+        return json(plan);
+      }
       const plan = await productionPlan(env, await withRunPer({ source: g("source"), final: g("final"), fromBin: g("fromBin"), produced: g("produced"),
         finalSize: g("finalSize"), sourceSize: g("sourceSize"), itemId: g("itemId") }));
       // Whether the worker can remember finished steps here (the double-run guards rely on it).
@@ -2638,7 +3112,11 @@ async function handle(request, env) {
       if (!itemId) return json({ error: "itemId is needed." }, 400);
       if (!RUN_KV) throw needKv();
       const keys = [doneKey(itemId), doneKey(itemId + "#g1"), doneKey(itemId + "#g2"), doneKey(itemId + "#g3"),
-        ...["groups", "disassembled", "disrec", "emptied", "leftover"].map((k) => lockKey(k, itemId))];
+        ...["groups", "disassembled", "disrec", "emptied", "leftover", "mixrun"].map((k) => lockKey(k, itemId))];
+      // A mix run's records per source and per 0.1 product.
+      const mr = await readRec("mixrun", itemId);
+      for (const x of mr?.sources || []) keys.push(lockKey("disrec", mixKey(itemId, x.sku)), lockKey("disassembled", mixKey(itemId, x.sku)), lockKey("brbase", mixKey(itemId, "base:" + x.bridge)));
+      for (const x of mr?.parts || []) keys.push(lockKey("emptied", mixKey(itemId, x.sku)));
       const had = [];
       for (const k of keys) { if (await durable.match(k)) had.push(new URL(k.url).pathname.split("/")[1]); await durable.delete(k); }
       return json({ cleared: true, itemId, had: [...new Set(had)],
