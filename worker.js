@@ -67,6 +67,10 @@
 //   time (bin list 10 min, catalog and kit parts 1 min, stock and bin qty 15 s); add &fresh=1 to read Sellercloud now.
 //   POST /assemble {sku,qty,itemId,fromBin,toBin[,source,perKit]}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //   /assemble/kit?sku=SKU          (ASSEMBLE_KEY) a product's kit parts and qty per kit (read-only)
+//   /assemble/platforms  (ASSEMBLE_KEY) platforms for "Create final SKU": prefix and company each (company: Text PLATFORM_COMPANY_<KEY>)
+//   POST /assemble/create-product {sku,name?,platform? or companyName/companyId,sourceSku?,productType?,itemId?}
+//     (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes) creates ONE product in that company. Refuses an SKU that exists
+//     in any company; never sends twice for the same SKU (KV record), no retries.
 //   /assemble/companies  (ASSEMBLE_KEY) every Sellercloud company with its id (read-only)
 //   /assemble/catalog?company=ID_or_NAME[&q=WORD&sku=SKU&page=1&raw=1]  (ASSEMBLE_KEY) products in any company (read-only)
 //   /assemble/find?q=WORD[&page=1]  (ASSEMBLE_KEY) search warehouse-company products in Sellercloud for the
@@ -3258,7 +3262,7 @@ async function handle(request, env) {
   const p0 = url.pathname.replace(/\/+$/, "");
   const isAssemble = p0 === "/assemble";
   const isPost = isAssemble || p0 === "/assemble/setup" || p0 === "/assemble/produce" || p0 === "/assemble/refresh" || p0 === "/assemble/clear"
-    || p0 === "/assemble/job/cancel" || p0 === "/assemble/job/ack";
+    || p0 === "/assemble/job/cancel" || p0 === "/assemble/job/ack" || p0 === "/assemble/create-product";
   const okMethod = p0 === "/assemble/job" ? ["GET", "POST"].includes(request.method) : isPost ? request.method === "POST" : request.method === "GET";
   if (!okMethod)
     return json({ error: isPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
@@ -3421,6 +3425,18 @@ async function handle(request, env) {
       const out = { warehouseId: assembleWarehouse(env), total: list.names.length, matches: hits.length, bins: hits.slice(0, cap) };
       if (url.searchParams.get("raw") === "1") out.rawReply = list.raw.slice(0, 3000);
       return json(out);
+    }
+
+    case "/assemble/platforms":
+      // Read-only: the platforms for "Create final SKU", with the SKU prefix and the Sellercloud company of each.
+      return json({ platforms: platformList(env) });
+
+    case "/assemble/create-product": {
+      // Shragy's press in the Hub only: create ONE final product in a platform company. Never retried, never twice.
+      let body = {};
+      try { body = (await request.json()) || {}; } catch {}
+      const { status, ...out } = await createFinalProduct(env, body);
+      return json(out, status || 200);
     }
 
     case "/assemble/catalog": {
@@ -3792,6 +3808,100 @@ async function catalogLook(env, { company, q, sku, page = 1, raw = false }) {
   const out = { company: co, q: q || null, sku: sku || null, page, totalResults: data.TotalResults ?? null, items: items.map(catalogRow) };
   if (raw && items[0]) out.fieldsOfFirst = Object.keys(items[0]);
   return out;
+}
+
+// ---- Create final SKU (Nov 19, Shragy): a production from a WAREHOUSE listing gets a final SKU made in the platform's
+// company. His rules: the platform's prefix goes at the start of the SKU, then the same SKU, short and simple.
+// "you write FBA OR FBM IN THE SKU"; East and West is "EAW"; "wfs is wfs"; e.g. Woot: WOOT cookies and cream 1LB.
+// The company is separate from the prefix. Each company can be changed with a Text variable (PLATFORM_COMPANY_<KEY>),
+// e.g. PLATFORM_COMPANY_WFS (assumed "Walmart company" until he says otherwise).
+const PLATFORMS = [
+  { key: "TEMU", label: "Temu", prefix: "Temu", company: "Temu" },
+  { key: "BB_FBA", label: "Amazon Betty Bet FBA", prefix: "FBA", company: "LG DEALS LLC" },
+  { key: "BB_FBM", label: "Amazon Betty Bet FBM", prefix: "FBM", company: "LG DEALS LLC" },
+  { key: "EAW_FBA", label: "Amazon East and West FBA", prefix: "EAW FBA", company: "EAST AND WEST SALES" },
+  { key: "EAW_FBM", label: "Amazon East and West FBM", prefix: "EAW FBM", company: "EAST AND WEST SALES" },
+  { key: "WALMART", label: "Walmart", prefix: "Walmart", company: "Walmart company" },
+  { key: "WFS", label: "WFS", prefix: "WFS", company: "Walmart company" },
+  { key: "WOOT", label: "Woot", prefix: "WOOT", company: "WOOT" },
+];
+function platformList(env) {
+  return PLATFORMS.map((x) => {
+    const c = String(env["PLATFORM_COMPANY_" + x.key] || "").trim();
+    return { ...x, company: c || x.company, companySetting: "PLATFORM_COMPANY_" + x.key };
+  });
+}
+const findPlatform = (env, v) => {
+  const w = normCo(v);
+  return w ? platformList(env).find((x) => normCo(x.key) === w || normCo(x.label) === w) || null : null;
+};
+const CREATED_KIND = "created-product";
+async function createFinalProduct(env, body) {
+  if (!assembleOn(env)) throw new HttpError(403, "Sellercloud writes are switched off. They turn on once ASSEMBLE_ENABLED is set to yes.");
+  if (!RUN_KV) throw needKv();
+  const sku = String(body.sku || "").trim().replace(/\s+/g, " ");
+  const name = String(body.name || "").trim().replace(/\s+/g, " ") || sku;
+  const sourceSku = String(body.sourceSku || "").trim();
+  if (!sku) return { status: 400, created: false, error: "sku is needed." };
+  if (sku.length > 100) return { status: 400, created: false, error: "That SKU is too long (over 100 characters)." };
+  if (name.length > 255) return { status: 400, created: false, error: "That name is too long (over 255 characters)." };
+  const platform = body.platform ? findPlatform(env, body.platform) : null;
+  if (body.platform && !platform) return { status: 400, created: false, error: `Unknown platform "${body.platform}".` };
+  const want = String(body.companyId || body.companyName || body.company || platform?.company || "").trim();
+  if (!want) return { status: 400, created: false, error: "Pick a platform or a company." };
+  const key = sku.toLowerCase();
+
+  // Created before by this route: answer the same again, nothing is sent.
+  const rec = await durable.match(lockKey(CREATED_KIND, key));
+  if (rec) {
+    let r = {}; try { r = JSON.parse(await rec.text()); } catch {}
+    if (r && r.sku) return { created: true, already: true, ...r, message: `${r.sku} was already created in ${r.company || "Sellercloud"}. Nothing was sent again.` };
+  }
+  // Another press is creating it right now.
+  if (await isLocked("creating-product", key))
+    return { status: 409, created: false, busy: true, error: `${sku} is being created right now. Wait a minute, then look again.` };
+
+  // Already in Sellercloud, in any company: refuse and show it.
+  const found = await scGet(env, "/catalog", { SKU: [sku], pageNumber: 1, pageSize: 5 });
+  const hit = (found.Items || []).find((p) => String(p.ID ?? p.ProductID ?? "").toLowerCase() === key);
+  if (hit) return { status: 409, created: false, exists: true, existing: catalogRow(hit),
+    error: `${hit.ID ?? sku} already exists in Sellercloud (company ${hit.CompanyName || hit.CompanyID || "?"}). Nothing was created.` };
+
+  const companies = await companyList(env);
+  const co = /^\d+$/.test(want) ? companies.find((c) => String(c.companyId) === want) : (companies.find((c) => normCo(c.company) === normCo(want)) || null);
+  if (!co) return { status: 400, created: false, error: `No Sellercloud company named "${want}". Nothing was created.`, companies: companies.map((c) => c.company) };
+
+  // Product type: copied from the source product (as for the 0.1 products); or given.
+  let type = String(body.productType || "").trim();
+  let source = null;
+  if (sourceSku) {
+    source = await findProduct(env, sourceSku);
+    if (!source) return { status: 400, created: false, error: `Source ${sourceSku} isn't in Sellercloud. Nothing was created.` };
+    type = type || String(source.ProductTypeName ?? source.ProductType ?? "").trim();
+  }
+  if (!type) return { status: 400, created: false, error: "Couldn't tell the product type (give sourceSku or productType). Nothing was created." };
+
+  const warnings = [];
+  if (platform && !sku.toLowerCase().startsWith(platform.prefix.toLowerCase()))
+    warnings.push(`The SKU doesn't start with ${platform.prefix}, the ${platform.label} prefix.`);
+
+  // One create per SKU: the lock holds for 2 minutes; a clear refusal from Sellercloud releases it so he can retry,
+  // an unclear end keeps it, and the next press finds the product (if it was made) before sending anything.
+  await lock("creating-product", key, 120);
+  const payload = { CompanyId: Number(co.companyId), ProductSKU: sku, ProductName: name, ProductTypeName: type };
+  try {
+    await scPost(env, "/Products", payload);
+  } catch (e) {
+    if (e instanceof HttpError) await durable.delete(lockKey("creating-product", key)).catch(() => {});
+    return { status: e.status || 502, created: false, error: `Sellercloud didn't create ${sku}: ${e.message}` };
+  }
+  const made = { sku, name, companyId: co.companyId, company: co.company, productType: type, sourceSku: sourceSku || null,
+    platform: platform ? platform.key : null, at: new Date().toISOString(), itemId: body.itemId ? String(body.itemId).slice(0, 40) : null };
+  await durable.put(lockKey(CREATED_KIND, key), JSON.stringify(made));
+  let shows = null;
+  try { shows = !!(await findProduct(env, sku)); } catch {}
+  return { created: true, ...made, showsInCatalog: shows, warnings,
+    message: `Created ${sku} in ${co.company}.${shows === false ? " Sellercloud may take a moment to show it." : ""}` };
 }
 
 export default {
