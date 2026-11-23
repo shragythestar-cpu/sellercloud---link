@@ -1924,13 +1924,31 @@ function importJobId(res) {
   }
   return null;
 }
+// Sellercloud's QueuedJobStatus numbers (developer.sellercloud.com, queued-job-statuses).
+const JOB_STATUS = { 0: "Submitted", 1: "Processing", 3: "Completed", 4: "Failed", 5: "PartialSuccess", 6: "OnHold", 7: "Cancelled",
+  8: "Cancelled_Service_Restarted", 9: "Aborted_Too_Much_Time_Consumed", 10: "Cancelled_While_Running" };
+// A queued job's own log lines (GET /QueuedJobs/{id}/Logs). A Kits import can finish as Completed with no ErrorMessage
+// and still skip a row; the reason is only in this log. Errors first, then the rest. Read-only, 1-2 calls.
+async function jobLogs(env, jobId) {
+  if (!jobId) return [];
+  const read = async (isError) => {
+    const d = await scGet(env, `/QueuedJobs/${encodeURIComponent(jobId)}/Logs`, { pageNumber: 1, pageSize: 20, ...(isError ? { IsError: true } : {}) });
+    return (d?.Items || d?.items || []).map((x) => ({ time: x.LogTime ?? null, error: !!x.IsError, message: String(x.Message ?? "").replace(/\s+/g, " ").trim() }))
+      .filter((x) => x.message);
+  };
+  try {
+    const errs = await read(true);
+    return errs.length ? errs : await read(false);
+  } catch (e) { return [{ error: true, message: `Couldn't read the job's log: ${String(e.message || e).slice(0, 150)}` }]; }
+}
+const logText = (logs) => logs.length ? " Sellercloud's job log: " + logs.slice(0, 5).map((x) => x.message.slice(0, 200)).join(" | ") + "." : "";
 async function kitJob(env, jobId) {
   const data = await scGet(env, "/QueuedJobs", { jobID: jobId });
   const job = (data.Items || data.items || [])[0];
   if (!job) return { found: false, done: false, error: null, said: "" };
   // Whatever the job says about itself (status, messages), for the Hub to show when a kit didn't save.
   const said = Object.entries(job).filter(([k, v]) => /status|message|error|result|note/i.test(k) && v != null && v !== "" && typeof v !== "object")
-    .map(([k, v]) => `${k}: ${String(v).replace(/\s+/g, " ").slice(0, 200)}`).join("; ").slice(0, 400);
+    .map(([k, v]) => `${k}: ${String(v).replace(/\s+/g, " ").slice(0, 200)}${/status/i.test(k) && JOB_STATUS[v] != null ? ` (${JOB_STATUS[v]})` : ""}`).join("; ").slice(0, 400);
   return { found: true, done: !!job.CompletedOn, error: job.ErrorMessage || null, said };
 }
 const lockKey = (kind, id) => new Request(`https://sellercloud-link.internal/${kind}/` + encodeURIComponent(String(id).toLowerCase()));
@@ -2348,9 +2366,10 @@ async function mixSetupStep(env, body) {
       return reply({ saved: false, continue: true, message: `Sellercloud hadn't shown ${kit}'s new recipe yet, so I sent it once more. Waiting for it to show.`, plan });
     }
     await recDel("kitjob", kit, state);
+    const logs = await jobLogs(env, job.jobId);
     if (x.step === "final kit" && x.state === "to change")
-      return reply({ saved: false, error: `Sellercloud still doesn't show ${kit}'s new recipe after sending it twice. Nothing was broken down or assembled. You can change it in its Kit tab, then press Run again.`, plan });
-    return reply({ saved: false, pending: true, message: `Sellercloud hadn't shown ${kit}'s kit after 2 minutes.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""} Check its Kit tab in a minute, then press Run again.`, plan });
+      return reply({ saved: false, error: `Sellercloud still doesn't show ${kit}'s new recipe after sending it twice. Nothing was broken down or assembled.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""}${logText(logs)} You can change it in its Kit tab, then press Run again.`, jobLog: logs, plan });
+    return reply({ saved: false, pending: true, message: `Sellercloud hadn't shown ${kit}'s kit after 2 minutes.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""}${logText(logs)} Check its Kit tab in a minute, then press Run again.`, jobLog: logs, plan });
   }
   for (const x of plan.steps.filter((y) => (y.step === "source kit" || y.step === "final kit") && y.action === "skip"))
     if (await recGet("kitjob", kitOf(x), body)) await recDel("kitjob", kitOf(x), state);
@@ -2959,9 +2978,10 @@ async function setupStep(env, body) {
       return reply({ saved: false, continue: true, message: `Sellercloud hadn't shown ${kit}'s new recipe yet, so I sent it once more. Waiting for it to show.`, plan });
     }
     await recDel("kitjob", kit, state);
+    const logs = await jobLogs(env, job.jobId);
     if (x.state === "to change")
-      return reply({ saved: false, error: `Sellercloud still shows ${kit}'s recipe as ${x.recipeFrom}, not ${x.recipeTo} ${x.want?.sku || ""} per kit, after sending the change twice. Nothing was broken down or assembled.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""} You can change it in its Kit tab, then press Run again.`, plan });
-    return reply({ saved: false, pending: true, message: `Sellercloud hadn't shown ${kit}'s kit after 2 minutes.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""} Check its Kit tab in a minute, then press Run again.`, plan });
+      return reply({ saved: false, error: `Sellercloud still shows ${kit}'s recipe as ${x.recipeFrom}, not ${x.recipeTo} ${x.want?.sku || ""} per kit, after sending the change twice. Nothing was broken down or assembled.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""}${logText(logs)} You can change it in its Kit tab, then press Run again.`, jobLog: logs, plan });
+    return reply({ saved: false, pending: true, message: `Sellercloud hadn't shown ${kit}'s kit after 2 minutes.${j.said ? ` Import job ${job.jobId}: ${j.said.slice(0, 200)}.` : ""}${logText(logs)} Check its Kit tab in a minute, then press Run again.`, jobLog: logs, plan });
   }
   // Kits that showed up: clear their records.
   for (const x of plan.steps.filter((y) => (y.step === "source kit" || y.step === "final kit") && y.action === "skip")) {
@@ -3718,7 +3738,12 @@ async function handle(request, env) {
       try { const d = await scGet(env, "/QueuedJobs", { pageNumber: 1, pageSize: 10 }); out.recentJobs = short((d?.Items || d?.items || d || []).slice?.(0, 10) ?? d); }
       catch (e) { out.recentJobs = { error: e.message }; }
       const job = url.searchParams.get("job");
-      if (job) { try { out.job = short(await scGet(env, "/QueuedJobs", { jobID: job })); } catch (e) { out.job = { error: e.message }; } }
+      if (job) {
+        try { out.job = short(await scGet(env, "/QueuedJobs", { jobID: job })); } catch (e) { out.job = { error: e.message }; }
+        try { out.jobDetail = short(await scGet(env, `/QueuedJobs/${encodeURIComponent(job)}`)); } catch (e) { out.jobDetail = { error: e.message }; }
+        try { out.jobLog = short(await scGet(env, `/QueuedJobs/${encodeURIComponent(job)}/Logs`, { pageNumber: 1, pageSize: 50 })); } catch (e) { out.jobLog = { error: e.message }; }
+        out.statusNames = JOB_STATUS;
+      }
       return json(out);
     }
 
