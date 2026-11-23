@@ -99,7 +99,7 @@
 //     GET  /assemble/jobs[?active=1]   every job (active=1: running, waiting, or finished and not acked yet).
 //     POST /assemble/job/cancel {itemId|jobId}   only before it starts.   POST /assemble/job/ack {jobIds}   board written.
 //   /soapops?type=Name                          the fields of one SOAP data type and their types (read-only)
-//   /kittool?sku=KIT                            read-only probe: how the web Kit tab's host (delta) signs in; KitTool/Load only
+//   /kittool?sku=KIT                            read-only: the kit as the web Kit tab loads it (delta host); never saves
 //   /cachecheck                                 whether the worker's saved-step memory works on this address (read-only)
 //   /assemblediag[?part=calls|send|stock|rest&sku=FINAL&fromBin=&toBin=] read-only assemble checks, one light part per call                 read-only: every Sellercloud assemble call and its fields, kit part fields,
 //                                   the Kits import columns, kit/assemble API endpoints, the kit's parts as Sellercloud stores them,
@@ -1051,16 +1051,13 @@ const SOAP_ASSEMBLE = "ProductKit_Assemble_New_4";
 const SOAP_DISASSEMBLE = "ProductKit_Disassemble_New3";
 // Removes the small 0.1 leftover from the From bin after an assembly (found on Shragy's server via /soapops?q=bin).
 const SOAP_ADJUST = "WarehouseBin_AdjustQtyByName_WithReason";
-// Nov 23: changing a kit part's qty on a kit with stock. The Kits import re-adds the part, and Sellercloud refuses that on a
-// kit with stock ("Please remove inventory before you add new item in kit", job 2398511); editing the qty by hand in the
-// Kit tab works (his test on Kisses Dark Chocolate Purple 1lb with 400 in stock). Sellercloud's SOAP has no "edit part"
-// call (/soapops?q=^ProductKit), so: AddKitItem for the part the kit already has, with its own Sequence and main flag and
-// the new qty, then read the kit back. Remove only fixes a doubled row that AddKitItem itself made.
-const SOAP_KIT_ADD = "ProductKit_AddKitItem";
-const SOAP_KIT_REMOVE = "ProductKit_RemoveKitItem";
+// Nov 23: a kit part's qty on a kit with stock. The Kits import and SOAP AddKitItem both re-add the part, and Sellercloud
+// refuses that on a kit with stock ("Please remove inventory before you add new item in kit"). The web Kit tab edits the
+// qty in place through a JSON call on the "delta" host (KitTool/Load and KitTool/Save); the worker signs in there with its
+// own Sellercloud login (delta's /api/token, checked with /kittool on Nov 23). See editKitParts.
 
 async function soapCall(env, op, bodyXml) {
-  const stockOp = op === SOAP_ASSEMBLE || op === SOAP_DISASSEMBLE || op === SOAP_ADJUST || op === SOAP_KIT_ADD || op === SOAP_KIT_REMOVE;
+  const stockOp = op === SOAP_ASSEMBLE || op === SOAP_DISASSEMBLE || op === SOAP_ADJUST;
   if (!SOAP_READS.has(op) && !stockOp) throw new HttpError(500, `SOAP call ${op} is not allowed.`);
   if (stockOp && !assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off.");
   if (!env.SC_USERNAME || !env.SC_PASSWORD) throw new HttpError(500, "SC_USERNAME or SC_PASSWORD is not set.");
@@ -3070,100 +3067,110 @@ async function sendKit(env, r, overwrite = false) {
   return { jobId };
 }
 
-// A kit's part rows with Sellercloud's own Sequence and main flag (ProductKit_ListKitItems, then GetKitDetails). Read-only.
-// [{ sku, qty, seq, main }]; seq/main are null when Sellercloud's reply doesn't carry them.
-async function kitRows(env, kit) {
-  const rowsOf = (xml) => {
-    const out = [];
-    const walk = (n) => {
-      const sku = kid(n, "KitProductId", "KitProductID", "ChildProductId", "ChildProductID", "ChildSKU");
-      const qty = kid(n, "KitQty", "Qty", "Quantity");
-      if (sku && qty != null) {
-        const seq = kid(n, "Sequence"), main = kid(n, "IsMainItem", "IsMain");
-        out.push({ sku, qty: Number(qty) || 0, seq: seq != null && /^-?\d+$/.test(seq) ? Number(seq) : null,
-          main: main == null ? null : /^(true|1)$/i.test(main) });
-        return;
-      }
-      n.kids.forEach(walk);
-    };
-    walk(xmlTree(xml));
-    return out.filter((r) => r.qty > 0);
-  };
-  let rows = [];
-  try { rows = rowsOf(await soapCall(env, "ProductKit_ListKitItems", `<MainProductID>${xmlEsc(kit)}</MainProductID>`)); } catch {}
-  if (!rows.length || rows.some((r) => r.seq == null || r.main == null)) {
-    const d = rowsOf(await soapCall(env, "ProductKit_GetKitDetails", `<KitParentProductID>${xmlEsc(kit)}</KitParentProductID>`));
-    if (!rows.length) rows = d;
-    else for (const r of rows) {
-      const m = d.find((x) => x.sku.toLowerCase() === r.sku.toLowerCase());
-      if (m) { if (r.seq == null) r.seq = m.seq; if (r.main == null) r.main = m.main; }
-    }
-  }
-  return rows;
+// ── The web Kit tab's own calls on the delta host (Nov 23) ──
+// Sign-in: POST {delta}/api/token with the worker's Sellercloud login (same body as the REST sign-in); the token is kept
+// like the REST one (KV, until shortly before it expires) and is never shown or logged.
+const DELTA_TOKEN_KEY = "sc-delta-token-v1";
+let deltaToken = null;
+async function deltaBase(env) {
+  const code = new URL(await getBase(env)).hostname.split(".")[0];   // e.g. lgd
+  return (env.SC_DELTA_URL || `https://${code}.delta.sellercloud.com`).trim().replace(/\/+$/, "");
 }
-const addKitXml = async (env, kit, row, qty, note) => (await wsdlBody(env, SOAP_KIT_ADD, {
-  MainProductID: kit, KitProductId: row.sku, KitQty: qty,
-  // Our own import set Sequence 1 on every kit it made; no main flag (false).
-  Sequence: row.seq ?? 1, IsMainItem: row.main ? "true" : "false",
-}, note)).xml;
-const soapFalse = (xml, op) => /^false$/i.test(String(tag1(xml, op + "Result") ?? "").trim());
+async function deltaGetToken(env) {
+  if (deltaToken && deltaToken.expiresAt > Date.now() + 60_000) return deltaToken.value;
+  const kept = await sharedGet(env, DELTA_TOKEN_KEY);
+  if (kept?.value && kept.expiresAt > Date.now() + 60_000) return (deltaToken = kept).value;
+  if (!env.SC_USERNAME || !env.SC_PASSWORD) throw new HttpError(500, "SC_USERNAME or SC_PASSWORD is not set.");
+  subrequests++; scCalls++;
+  const r = await fetch((await deltaBase(env)) + "/api/token", {
+    method: "POST", redirect: "manual", headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ Username: env.SC_USERNAME, Password: env.SC_PASSWORD }),
+  });
+  const text = await r.text();
+  let j = null; try { j = JSON.parse(text); } catch {}
+  if (!r.ok || !j?.access_token) throw new HttpError(502, `Sellercloud's Kit tab sign-in failed (${r.status}).${j?.error_description || j?.Message ? " Sellercloud said: " + String(j.error_description || j.Message).slice(0, 200) : ""}`);
+  const secs = Number(j.expires_in) > 0 ? Number(j.expires_in) : 1500;
+  deltaToken = { value: j.access_token, expiresAt: Date.now() + secs * 1000 };
+  await sharedPut(env, DELTA_TOKEN_KEY, deltaToken, secs - 120);
+  return deltaToken.value;
+}
+// Only these Kit tab calls; Save is a write and needs ASSEMBLE_ENABLED = yes.
+const KITTOOL_READS = new Set(["Load", "GetKitAssemblies"]);
+async function kitTool(env, action, body) {
+  const write = action === "Save";
+  if (!write && !KITTOOL_READS.has(action)) throw new HttpError(500, `KitTool/${action} is not allowed.`);
+  if (write && !assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off.");
+  const url = (await deltaBase(env)) + "/api/Toolbox/Product/KitTool/" + action;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await deltaGetToken(env);
+    subrequests++; scCalls++;
+    const r = await fetch(url, {
+      method: "POST", redirect: "manual",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+      body: JSON.stringify(body),
+    });
+    // A refused token: sign in again once (reads and Save alike; a 401 means nothing was done).
+    if (r.status === 401 && attempt === 0) { deltaToken = null; await sharedDel(env, DELTA_TOKEN_KEY); continue; }
+    const text = await r.text();
+    let j = null; try { j = JSON.parse(text); } catch {}
+    if (!r.ok) throw new HttpError(502, `Sellercloud's Kit tab ${action} failed (${r.status}). ${(j ? kitToolSaid(j) : text.replace(/\s+/g, " ")).slice(0, 300)}`);
+    if (!j) throw new HttpError(502, `Sellercloud's Kit tab ${action} didn't answer with data.`);
+    return j;
+  }
+}
+const kitToolSaid = (j) => [j?.Notification?.Title, j?.Notification?.Message, j?.Message, j?.ExceptionMessage].filter(Boolean).join(": ");
+async function kitToolLoad(env, kit) {
+  const j = await kitTool(env, "Load", { Id: kit });
+  const dto = j?.Data?.DTO || j?.Data?.Dto || null;
+  if (!dto || !Array.isArray(dto.Items)) throw new HttpError(502, `Sellercloud's Kit tab didn't load ${kit}.${kitToolSaid(j) ? " " + kitToolSaid(j) : ""}`);
+  return dto;
+}
+const kitToolParts = (dto) => (dto.Items || []).map((i) => ({ sku: String(i.ChildProductID || ""), perKit: Number(i.Qty) || 0 })).filter((x) => x.sku);
 
-// Changes the qty of parts a kit already has, then reads the kit back until it shows exactly `want` (same parts, new
-// qtys). Never adds a new part or drops one: a recipe with a new or missing part goes through the import.
-// { unsupported } when the parts differ; { ok, got } or { error, got } otherwise.
+// Changes the qty of parts a kit already has, the way the web Kit tab does: Load the kit, change only those parts' Qty
+// (and the item count), leave every other field as loaded, Save, then Load again. Goes on only when the kit reads back
+// with exactly the same parts and the new qtys. Never adds or drops a part: a recipe with a new or missing part goes
+// through the import. { unsupported } when the parts differ; { ok, got } or { error, got } otherwise.
 async function editKitParts(env, kit, want, note) {
   const lc = (x) => String(x).toLowerCase();
   const same = (a, b) => a.length === b.length && b.every((w) => a.some((c) => lc(c.sku) === lc(w.sku)));
   const exact = (got) => same(got, want) && want.every((w) => got.find((x) => lc(x.sku) === lc(w.sku)).perKit === w.perKit);
   const show = (got) => got.map((x) => `${x.perKit} ${x.sku}`).join(" + ") || "no parts";
-  const readBack = async (tries) => {
-    let got = [];
-    for (let i = 0; i < tries; i++) {
-      if (i) await sleep(3000);
-      got = await kitRecipe(env, kit);
-      if (exact(got)) return { ok: true, got };
-    }
-    return { got };
-  };
-  const cur = await kitRecipe(env, kit);
+  const dto = await kitToolLoad(env, kit);
+  const cur = kitToolParts(dto);
   if (!same(cur, want)) return { unsupported: true, reason: "parts differ" };
   if (exact(cur)) return { ok: true, got: cur };
-  const rows = await kitRows(env, kit);
-  const kitInt = (await opFields(env, SOAP_KIT_ADD).catch(() => [])).find((f) => f.name === "KitQty");
-  if (kitInt && /^(int|long|short)$/i.test(kitInt.type) && want.some((w) => !Number.isInteger(w.perKit)))
-    return { error: `Sellercloud takes whole numbers per kit, and this run needs ${want.map((w) => w.perKit).join(", ")}.`, got: cur };
-  const changed = [];
-  for (const w of want) {
-    const c = cur.find((x) => lc(x.sku) === lc(w.sku));
-    if (c.perKit === w.perKit) continue;
-    const row = rows.find((x) => lc(x.sku) === lc(c.sku)) || { sku: c.sku, seq: null, main: null };
-    let xml;
-    try { xml = await soapCall(env, SOAP_KIT_ADD, await addKitXml(env, kit, row, w.perKit, note)); }
-    catch (e) { return { error: `Sellercloud refused the new qty for ${c.sku}: ${e.message}${changed.length ? ` (already changed: ${changed.join(", ")})` : ""}`, got: await kitRecipe(env, kit).catch(() => []) }; }
-    if (soapFalse(xml, SOAP_KIT_ADD)) return { error: `Sellercloud answered "false" to the new qty for ${c.sku}.`, got: await kitRecipe(env, kit).catch(() => []) };
-    changed.push(c.sku);
-    // Sellercloud may update the row or add a second row for the same part. Look before the next part.
-    const now = await kitRecipe(env, kit);
-    const dup = now.filter((x) => lc(x.sku) === lc(c.sku)).length > 1;
-    if (dup) {
-      // AddKitItem doubled the part. Remove that part's rows and add it once with the new qty.
-      await soapCall(env, SOAP_KIT_REMOVE, (await wsdlBody(env, SOAP_KIT_REMOVE, { MainProductID: kit, KitProductId: c.sku }, note)).xml);
-      await sleep(1500);
-      const after = await kitRecipe(env, kit);
-      const left = after.filter((x) => lc(x.sku) === lc(c.sku));
-      if (left.length > 1) return { error: `${kit} still has ${c.sku} more than once after removing the extra row.`, got: after };
-      if (left.length === 1 && left[0].perKit !== w.perKit) return { error: `${kit} has ${c.sku} at ${left[0].perKit} per kit after removing the extra row, not ${w.perKit}.`, got: after };
-      if (!left.length) {
-        let x2;
-        try { x2 = await soapCall(env, SOAP_KIT_ADD, await addKitXml(env, kit, row, w.perKit, note)); }
-        catch (e) { return { error: `IMPORTANT: ${kit} has no ${c.sku} row now. Sellercloud refused adding it back at ${w.perKit} per kit: ${e.message} Add it in its Kit tab.`, got: after, critical: true }; }
-        if (soapFalse(x2, SOAP_KIT_ADD)) return { error: `IMPORTANT: ${kit} has no ${c.sku} row now; Sellercloud answered "false" to adding it back at ${w.perKit} per kit. Add it in its Kit tab.`, got: after, critical: true };
-      }
-    }
+  if (new Set(cur.map((x) => lc(x.sku))).size !== cur.length) return { error: `${kit} has a part listed twice in its Kit tab; fix it there first.`, got: cur };
+
+  // The Kit tab sends its kit assemblies list with Save; read it the same way when Load doesn't carry it.
+  if (!("KitAssemblies" in dto)) {
+    try {
+      const a = await kitTool(env, "GetKitAssemblies", { Id: kit });
+      const list = Array.isArray(a?.Data) ? a.Data : Array.isArray(a?.Data?.DTO) ? a.Data.DTO : Array.isArray(a?.Data?.Items) ? a.Data.Items : null;
+      if (list) dto.KitAssemblies = list;
+    } catch {}
   }
-  const r = await readBack(8);
-  if (r.ok) return r;
-  return { error: `${kit} reads back as ${show(r.got)} after the change.`, got: r.got };
+  for (const it of dto.Items) {
+    const w = want.find((x) => lc(x.sku) === lc(it.ChildProductID));
+    if (!w || (Number(it.Qty) || 0) === w.perKit) continue;
+    it.Qty = String(w.perKit);               // the Kit tab sends an edited qty as text
+    if (it.RowStatus == null) it.RowStatus = 0;
+  }
+  if (dto.General && typeof dto.General === "object")
+    dto.General.ItemCount = dto.Items.reduce((n, it) => n + (Number(it.Qty) || 0), 0);
+
+  let saved;
+  try { saved = await kitTool(env, "Save", { ToolParameters: { Id: kit }, Dto: dto }); }
+  catch (e) { return { error: `Sellercloud refused the new recipe: ${e.message}`, got: cur }; }
+  if (saved?.Success === false) return { error: `Sellercloud refused the new recipe: ${kitToolSaid(saved) || "no reason given"}.`, got: cur };
+
+  let got = [];
+  for (let i = 0; i < 5; i++) {
+    if (i) await sleep(2000);
+    got = kitToolParts(await kitToolLoad(env, kit));
+    if (exact(got)) return { ok: true, got };
+  }
+  return { error: `${kit} reads back as ${show(got)} after the save${kitToolSaid(saved) ? ` (Sellercloud said: ${kitToolSaid(saved)})` : ""}.`, got };
 }
 
 // An assembly record for one group: none, confirmed, pending (sent, Sellercloud not showing it yet) or bad.
@@ -3373,68 +3380,12 @@ async function produceProduction(env, body) {
 
 // Lists the SOAP service's operations (from its own WSDL) whose name matches q, with their inputs.
 // Read-only: it only downloads the service description.
-// The web Kit tab saves through a JSON call on the "delta" host (KitTool/Save), signed by the web session cookie.
-// Read-only probe (Nov 23) of how delta signs in, using only the worker's own Sellercloud login. Never calls Save and never
-// follows a redirect. Shows statuses, the auth scheme delta asks for, redirect paths and cookie NAMES only: no token,
-// cookie or password value is ever shown.
+// Read-only: the kit as the web Kit tab loads it (delta host, the worker's own sign-in). Never saves.
 async function kitToolLoadTest(env, sku) {
-  const base = await getBase(env);
-  const apiHost = new URL(base).hostname;              // e.g. lgd.api.sellercloud.com
-  const code = apiHost.split(".")[0];
-  const delta = (env.SC_DELTA_URL || `https://${code}.delta.sellercloud.com`).trim().replace(/\/+$/, "");
-  const loadUrl = delta + "/api/Toolbox/Product/KitTool/Load";
-  const cookieNames = (r) => {
-    const all = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [r.headers.get("set-cookie") || ""].filter(Boolean);
-    return all.map((c) => c.split("=")[0].trim()).filter(Boolean);
-  };
-  const trim = (v) => JSON.parse(JSON.stringify(v ?? null, (k, x) => (typeof x === "string" && x.length > 400 ? x.slice(0, 400) + "…" : x)));
-  const short = (text) => { try { return trim(JSON.parse(text)); } catch { return text.replace(/\s+/g, " ").slice(0, 300); } };
-  const info = (r) => ({ status: r.status, contentType: r.headers.get("content-type") || "",
-    wwwAuthenticate: r.headers.get("www-authenticate") || undefined,
-    redirectTo: r.headers.get("location") ? r.headers.get("location").split("?")[0] : undefined,
-    setsCookies: cookieNames(r) });
-  const hit = async (u, init) => { subrequests++; scCalls++; return fetch(u, { redirect: "manual", ...init }); };
-  const load = async (headers) => {
-    const r = await hit(loadUrl, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json", "X-Requested-With": "XMLHttpRequest", ...headers }, body: JSON.stringify({ Id: sku }) });
-    const text = await r.text();
-    let body = null; try { body = JSON.parse(text); } catch {}
-    const dto = body?.Data?.DTO || body?.Data?.Dto || null;
-    return { ...info(r), works: r.ok && !!dto, items: dto ? (dto.Items || []).map((i) => ({ part: i.ChildProductID, qty: i.Qty, isMain: i.IsMainItem })) : undefined, reply: dto ? undefined : short(text) };
-  };
-  const out = { sku, delta, tries: [] };
-  const step = async (name, fn) => { const row = { try: name }; try { Object.assign(row, await fn()); } catch (e) { row.error = e.message; } out.tries.push(row); return row; };
-  const restToken = await getToken(env, base);
-
-  // 1. REST token as Bearer (shows the auth scheme delta asks for).
-  const t1 = await step("Load with the REST token as Bearer", () => load({ Authorization: "Bearer " + restToken }));
-  if (t1.works) return { ...out, works: true, how: "rest-bearer" };
-  // 2. Where delta sends a browser that isn't signed in (sign-in page path, cookie names).
-  await step("Open delta's home page (not signed in)", async () => info(await hit(delta + "/", { method: "GET" })));
-  // 3. A token sign-in on delta with the worker's existing login (same shape as the REST sign-in). Status only.
-  for (const path of ["/api/token", "/rest/api/token"]) {
-    let tok = null;
-    const row = await step(`Sign in at delta ${path}`, async () => {
-      const r = await hit(delta + path, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ Username: env.SC_USERNAME, Password: env.SC_PASSWORD }) });
-      const text = await r.text();
-      let j = null; try { j = JSON.parse(text); } catch {}
-      tok = j?.access_token || j?.token || j?.Token || null;
-      return { ...info(r), gotToken: !!tok, replyKeys: j && typeof j === "object" ? Object.keys(j) : undefined, reply: tok || r.ok ? undefined : short(text) };
-    });
-    if (tok) {
-      const t = await step(`Load with the token from ${path} as Bearer`, () => load({ Authorization: "Bearer " + tok }));
-      if (t.works) return { ...out, works: true, how: "delta-token " + path };
-    }
-    if (row.status && row.status !== 404) break; // that path exists; no need to try the other
-  }
-  // 4. The REST token in the cookies delta itself sets, if any are named like a token or auth cookie.
-  const names = [...new Set(out.tries.flatMap((t) => t.setsCookies || []))].filter((n) => /token|auth|jwt|bearer/i.test(n));
-  for (const n of names.slice(0, 3)) {
-    const t = await step(`Load with the REST token in cookie ${n}`, () => load({ Cookie: `${n}=${restToken}` }));
-    if (t.works) return { ...out, works: true, how: "cookie " + n };
-  }
-  out.works = false;
-  return out;
+  const dto = await kitToolLoad(env, sku);
+  return { sku, works: true, items: (dto.Items || []).map((i) => ({ part: i.ChildProductID, qty: i.Qty, isMain: i.IsMainItem })),
+    itemCount: dto.General?.ItemCount ?? null, inventoryQty: dto.General?.InventoryQty ?? null, availableQuantity: dto.AvailableQuantity ?? null,
+    hasKitAssemblies: "KitAssemblies" in dto, hasRelatedKits: "RelatedKits" in dto, fields: Object.keys(dto) };
 }
 
 async function soapOps(env, q, type) {
