@@ -525,6 +525,15 @@ function warehouseCompanyId(env) {
 function needCompany(env) {
   if (!companySetting(env)) throw new HttpError(500, "WAREHOUSE_COMPANY is empty.");
 }
+// Nov 23 (his yes): a kit's FINAL SKU may be under WAREHOUSE or any platform company in PLATFORMS (Temu, LG DEALS LLC,
+// EAST AND WEST SALES, Walmart company, WOOT, or a PLATFORM_COMPANY_<KEY> override, by name or id).
+// Sources, kit parts and the 0.1 products stay WAREHOUSE only; the warehouse is still only ASSEMBLE_WAREHOUSE.
+function isPlatformCompany(env, p) {
+  const names = new Set(platformList(env).map((x) => normCo(x.company)).filter(Boolean));
+  return names.has(normCo(p.CompanyName)) || (p.CompanyID != null && names.has(normCo(p.CompanyID)));
+}
+const finalCompanyOk = (env, p) => companyMatches(env, p) || isPlatformCompany(env, p);
+const notFinalCompany = (sku, p) => `${sku} belongs to ${p.CompanyName || "another company"}, which isn't WAREHOUSE or a platform company.`;
 
 
 // ───────────────────────── Hourly copy into monday ─────────────────────────
@@ -1297,11 +1306,18 @@ async function assemblePreview(env, sku, qty, fromBin = "") {
   const found = await scGet(env, "/catalog", { SKU: [sku], pageNumber: 1, pageSize: 5 });
   const product = (found.Items || []).find((p) => String(p.ID ?? p.ProductID) === sku);
   if (!product) throw new HttpError(404, `No product with SKU ${sku} in Sellercloud.`);
-  if (!companyMatches(env, product))
-    throw new HttpError(409, `${sku} belongs to ${product.CompanyName || "another company"}, not WAREHOUSE.`);
+  if (!finalCompanyOk(env, product)) throw new HttpError(409, notFinalCompany(sku, product));
   const recipe = await kitRecipe(env, sku);
   const problems = [];
   if (!recipe.length) problems.push(`${sku} has no kit recipe in Sellercloud, so it can't be assembled.`);
+  // A final under a platform company still only takes WAREHOUSE parts.
+  if (!companyMatches(env, product)) {
+    await pool(recipe, 2, async (p) => {
+      const part = await findProduct(env, p.sku);
+      if (!part) problems.push(`Part ${p.sku} isn't a product in Sellercloud.`);
+      else if (!companyMatches(env, part)) problems.push(`Part ${p.sku} belongs to ${part.CompanyName || "another company"}, not WAREHOUSE. Kit parts must be WAREHOUSE products.`);
+    });
+  }
   const parts = [];
   await pool(recipe, 2, async (p) => {
     const q = await whQty(env, p.sku);
@@ -1517,13 +1533,14 @@ function wsdlTypeFields(wsdl, type) {
 }
 
 // A kit's current parts, with names. Read-only.
-async function kitDefinition(env, sku) {
+// final: true only for a kit's final SKU, which may also be under a platform company. Everything else stays WAREHOUSE.
+async function kitDefinition(env, sku, { final = false } = {}) {
   needCompany(env);
   if (!sku) throw new HttpError(400, "Add ?sku=... (the product's SKU).");
   const product = await findProduct(env, sku);
   if (!product) return { sku, exists: false, name: null, isKit: false, components: [] };
-  if (!companyMatches(env, product))
-    throw new HttpError(409, `${sku} belongs to ${product.CompanyName || "another company"}, not WAREHOUSE.`);
+  if (final ? !finalCompanyOk(env, product) : !companyMatches(env, product))
+    throw new HttpError(409, final ? notFinalCompany(sku, product) : `${sku} belongs to ${product.CompanyName || "another company"}, not WAREHOUSE.`);
   let recipe = [], kitError = null;
   // A busy answer is passed on (the Hub retries), so it never reads as "this product has no kit parts".
   try { recipe = await kitRecipe(env, sku); } catch (e) { if (e.busy) throw e; kitError = e.message || String(e); }
@@ -1535,6 +1552,7 @@ async function kitDefinition(env, sku) {
   });
   components.sort((a, b) => a.sku.localeCompare(b.sku));
   return { sku, exists: true, name: product.ProductName ?? null, productType: product.ProductTypeName ?? product.ProductType ?? null,
+    company: product.CompanyName ?? null, companyId: product.CompanyID ?? null,
     isKit: components.length > 0, components, sellercloudSaid: kitError };
 }
 
@@ -1627,7 +1645,7 @@ async function productionPlan(env, q) {
   const problems = [], steps = [];
   const source = await kitDefinition(env, sourceSku);
   if (!source.exists) throw new HttpError(404, `No product with SKU ${sourceSku} in Sellercloud.`);
-  const final = await kitDefinition(env, finalSku);
+  const final = await kitDefinition(env, finalSku, { final: true });
   if (!final.exists) problems.push(`${finalSku} isn't a product in Sellercloud. Create it there first.`);
   // A kit read that failed must never look like "no kit yet" (that would set a new kit over an existing one).
   for (const d of [source, final])
@@ -2171,7 +2189,7 @@ async function mixPlan(env, q) {
   const problems = [], steps = [], sources = [], unknownTypes = [];
   if (!fromBin) problems.push("Pick the From bin.");
 
-  const final = await kitDefinition(env, finalSku);
+  const final = await kitDefinition(env, finalSku, { final: true });
   if (!final.exists) problems.push(`${finalSku} isn't a product in Sellercloud. Create it there first.`);
   else if (final.sellercloudSaid && !/is not a kit/i.test(final.sellercloudSaid)) problems.push(`Couldn't read ${finalSku}'s kit parts from Sellercloud (${final.sellercloudSaid}). Try again in a minute.`);
   const finalSize = sizeTyped(q.finalSize) || sizeFromName(finalSku) || sizeFromName(final.name);
@@ -3448,10 +3466,13 @@ async function handle(request, env) {
       const q = (url.searchParams.get("q") || "").trim();
       if (q.length < 2) return json({ error: "Type at least 2 characters." }, 400);
       const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10));
+      // Nov 23: WAREHOUSE plus the platform companies (a final SKU may be under either).
+      const searched = await finalCompanies(env);
       const companyId = warehouseCompanyId(env);
+      const ids = [...new Set([companyId, ...searched.ids].filter((x) => x != null && x !== "").map(String))];
       let data;
       try {
-        data = await scGet(env, "/catalog", { Keyword: q, companyID: companyId ? [companyId] : undefined, pageNumber: page, pageSize: 25 });
+        data = await scGet(env, "/catalog", { Keyword: q, companyID: ids.length ? ids : undefined, pageNumber: page, pageSize: 25 });
       } catch (e) {
         // Sellercloud busy or not answering: search the Sellercloud Products board instead, so the picker still
         // works. The board only holds products that had stock, so a brand-new 0-stock SKU may be missing there.
@@ -3471,25 +3492,26 @@ async function handle(request, env) {
         return json({ q, page, pageSize: 25, totalResults: null, items, source: "board", busy: !!e.busy, retryAt, sellercloud,
           note: `${why} These are from the Sellercloud Products board; a new product with no stock may not be listed yet.` });
       }
-      let raw = (data.Items || []).filter((p) => companyMatches(env, p));
+      let raw = (data.Items || []).filter((p) => finalCompanyOk(env, p));
       // An exact SKU the keyword search missed (page 1 only).
       if (page === 1 && !raw.some((p) => String(p.ID ?? p.ProductID ?? "").toLowerCase() === q.toLowerCase())) {
         try {
           const exact = await scGet(env, "/catalog", { SKU: [q], pageNumber: 1, pageSize: 5 });
-          const hit = (exact.Items || []).find((p) => String(p.ID ?? p.ProductID ?? "").toLowerCase() === q.toLowerCase() && companyMatches(env, p));
+          const hit = (exact.Items || []).find((p) => String(p.ID ?? p.ProductID ?? "").toLowerCase() === q.toLowerCase() && finalCompanyOk(env, p));
           if (hit) raw = [hit, ...raw];
         } catch {}
       }
       const urlTemplate = env.SC_PRODUCT_URL || "https://lgd.delta.sellercloud.com/catalog/catalog-details.aspx?ID={sku}";
       const items = raw.map((p) => {
         const x = slimProduct(p);
-        return { ...x, link: x.sku ? urlTemplate.replace("{sku}", encodeURIComponent(x.sku)) : null };
+        return { ...x, warehouseCompany: companyMatches(env, p), link: x.sku ? urlTemplate.replace("{sku}", encodeURIComponent(x.sku)) : null };
       });
-      return json({ q, page, pageSize: 25, totalResults: companyId ? data.TotalResults ?? null : null, items });
+      return json({ q, page, pageSize: 25, totalResults: ids.length ? data.TotalResults ?? null : null, items,
+        companies: searched.names, ...(searched.note ? { note: searched.note } : {}) });
     }
 
     case "/assemble/kit": {
-      return json(await kitDefinition(env, (url.searchParams.get("sku") || "").trim()));
+      return json(await kitDefinition(env, (url.searchParams.get("sku") || "").trim(), { final: url.searchParams.get("final") === "1" }));
     }
 
     case "/assemble/plan": {
@@ -3767,6 +3789,24 @@ async function companyList(env) {
   }));
 }
 const normCo = (x) => String(x || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+// The platform companies' ids for the final-SKU search (/assemble/find), from Sellercloud's company list
+// (1 call, kept 6 hours). If the list can't be read, the search falls back to WAREHOUSE only and says so.
+let finalCoCache = null;
+async function finalCompanies(env) {
+  const want = [...new Set(platformList(env).map((x) => x.company).filter(Boolean))];
+  const key = want.map(normCo).join("|");
+  if (finalCoCache && finalCoCache.key === key && Date.now() - finalCoCache.at < 6 * 3600e3) return finalCoCache.v;
+  let list;
+  try { list = await companyList(env); } catch {
+    return { ids: [], names: ["WAREHOUSE"], note: "Couldn't read Sellercloud's company list, so only WAREHOUSE was searched." };
+  }
+  const found = want.map((w) => (/^\d+$/.test(w) ? list.find((c) => String(c.companyId) === w) : list.find((c) => normCo(c.company) === normCo(w)))).filter(Boolean);
+  const missing = want.filter((w) => !found.some((c) => String(c.companyId) === w || normCo(c.company) === normCo(w)));
+  const v = { ids: found.map((c) => c.companyId), names: ["WAREHOUSE", ...found.map((c) => c.company)],
+    note: missing.length ? `No Sellercloud company named ${missing.join(", ")}, so it wasn't searched.` : null };
+  finalCoCache = { key, at: Date.now(), v };
+  return v;
+}
 function pickCompany(list, want) {
   if (/^\d+$/.test(want)) return list.find((c) => String(c.companyId) === want) || { companyId: want, company: null };
   const w = normCo(want);
