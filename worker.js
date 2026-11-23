@@ -994,20 +994,10 @@ async function pullRequest(env, { sku, qty, note }) {
   if (!product) throw new HttpError(404, "No product with this SKU in Sellercloud.");
   if (!companyMatches(env, product))
     throw new HttpError(409, `This SKU belongs to ${product.CompanyName || "another company"}, not WAREHOUSE.`);
-  const available = await countedQty(env, sku);
-  const bins = await skustackBins(env, sku);
+  // Nov 23: the crew chat message is only the SKU, nothing else for now.
+  // Stock and bin lookups are skipped here so a request uses fewer Sellercloud calls.
   if (await recentlyPosted(sku)) throw new HttpError(429, "This SKU was already posted in the last minute.");
-  const lines = [
-    "*Please bring to the production room*",
-    product.ProductName || sku,
-    `SKU: ${sku}`,
-    qty ? `Qty needed: ${qty}` : null,
-    `Available in Skustack: ${available}`,
-    bins && bins.length
-      ? "Bins: " + bins.map((b) => `${b.bin} (${b.qty})`).join(", ")
-      : null,
-    note ? `Note: ${note}` : null,
-  ].filter(Boolean);
+  const lines = [sku];
   await markPosted(sku); // mark first so a fast double click doesn't post twice
   try {
     await postToChat(env, lines.join("\n"));
@@ -1015,7 +1005,7 @@ async function pullRequest(env, { sku, qty, note }) {
     await caches.default.delete(guardKey(sku)).catch(() => {});
     throw e;
   }
-  return { posted: true, sku, qty: qty || null, available, bins: bins || [] };
+  return { posted: true, sku, qty: qty || null, available: null, bins: [] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3273,7 +3263,7 @@ async function handle(request, env) {
   const path = url.pathname.replace(/\/+$/, "");
   // PULL_KEY (Secret, optional) is a second key that only works for /pull, so the Production Hub
   // button can carry it without giving out the main key.
-  const pullOk = path === "/pull" && env.PULL_KEY && safeEqual(key, env.PULL_KEY);
+  const pullOk = path === "/pull" && env.PULL_KEY && env.PULL_KEY.trim() && safeEqual(key.trim(), env.PULL_KEY.trim());
   // ASSEMBLE_KEY (Secret) is the only key that works for /assemble/... routes; the main key can't assemble or set up kits.
   if (path === "/assemble" || path.startsWith("/assemble/")) {
     if (!env.ASSEMBLE_KEY || !safeEqual(key, env.ASSEMBLE_KEY)) return json({ error: "Missing or wrong assemble key." }, 401);
