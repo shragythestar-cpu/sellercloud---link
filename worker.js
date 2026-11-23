@@ -99,6 +99,7 @@
 //     GET  /assemble/jobs[?active=1]   every job (active=1: running, waiting, or finished and not acked yet).
 //     POST /assemble/job/cancel {itemId|jobId}   only before it starts.   POST /assemble/job/ack {jobIds}   board written.
 //   /soapops?type=Name                          the fields of one SOAP data type and their types (read-only)
+//   /kittool?sku=KIT                            read-only: tries the web Kit tab's KitTool/Load with the worker's REST token
 //   /cachecheck                                 whether the worker's saved-step memory works on this address (read-only)
 //   /assemblediag[?part=calls|send|stock|rest&sku=FINAL&fromBin=&toBin=] read-only assemble checks, one light part per call                 read-only: every Sellercloud assemble call and its fields, kit part fields,
 //                                   the Kits import columns, kit/assemble API endpoints, the kit's parts as Sellercloud stores them,
@@ -3372,6 +3373,47 @@ async function produceProduction(env, body) {
 
 // Lists the SOAP service's operations (from its own WSDL) whose name matches q, with their inputs.
 // Read-only: it only downloads the service description.
+// The web Kit tab saves through a JSON call on the "delta" host (KitTool/Save), signed by the web session cookie.
+// This tries only its read twin, KitTool/Load, with the worker's REST Bearer token: on the delta host, then on the
+// REST host. Never follows a redirect (a redirect to sign-in means the token isn't accepted there). Read-only.
+async function kitToolLoadTest(env, sku) {
+  const base = await getBase(env);
+  const apiHost = new URL(base).hostname;              // e.g. lgd.api.sellercloud.com
+  const code = apiHost.split(".")[0];
+  const delta = (env.SC_DELTA_URL || `https://${code}.delta.sellercloud.com`).trim().replace(/\/+$/, "");
+  const path = "/api/Toolbox/Product/KitTool/Load";
+  const urls = [delta + path, `https://${apiHost}${path}`, base.replace(/\/api$/i, "") + path];
+  const trim = (v) => JSON.parse(JSON.stringify(v ?? null, (k, x) => (typeof x === "string" && x.length > 600 ? x.slice(0, 600) + "…" : x)));
+  const out = { sku, tried: [] };
+  for (const u of [...new Set(urls)]) {
+    const row = { url: u };
+    try {
+      const token = await getToken(env, base);
+      subrequests++; scCalls++;
+      const r = await fetch(u, {
+        method: "POST", redirect: "manual",
+        headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+        body: JSON.stringify({ Id: sku }),
+      });
+      row.status = r.status;
+      row.contentType = r.headers.get("content-type") || "";
+      const loc = r.headers.get("location");
+      if (loc) row.redirectTo = loc.split("?")[0];
+      const text = await r.text();
+      let body = null;
+      try { body = JSON.parse(text); } catch { body = text.replace(/\s+/g, " ").slice(0, 600); }
+      const dto = body && typeof body === "object" ? (body.Data?.DTO || body.Data?.Dto || null) : null;
+      row.works = r.ok && !!dto;
+      if (dto) row.items = (dto.Items || []).map((i) => ({ part: i.ChildProductID, qty: i.Qty, isMain: i.IsMainItem, rowStatus: i.RowStatus }));
+      row.reply = trim(body);
+    } catch (e) { row.error = e.message; }
+    out.tried.push(row);
+    if (row.works) break;
+  }
+  out.works = out.tried.some((t) => t.works);
+  return out;
+}
+
 async function soapOps(env, q, type) {
   const wsdl = await wsdlText(env);
   if (type) return { type, fields: wsdlTypeFields(wsdl, type) };
@@ -3841,6 +3883,14 @@ async function handle(request, env) {
 
     case "/soapops": {
       return json(await soapOps(env, url.searchParams.get("q") || "bin", (url.searchParams.get("type") || "").trim()));
+    }
+
+    case "/kittool": {
+      // Read-only test (Nov 23): does the web Kit tab's own JSON call (KitTool/Load) accept the worker's REST token?
+      // Sends one Load per host, no Save. Answers each host's status and reply (long text trimmed).
+      const sku = (url.searchParams.get("sku") || "").trim();
+      if (!sku) return json({ error: "Add ?sku=KIT SKU." }, 400);
+      return json(await kitToolLoadTest(env, sku));
     }
 
     case "/kitimport": {
