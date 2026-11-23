@@ -1045,14 +1045,21 @@ async function soapUrl(env) {
 }
 
 // Read-only SOAP calls the worker may make. Nothing here adjusts, sets, transfers or adds stock.
-const SOAP_READS = new Set(["GetCurrentUser", "ProductKit_GetKitDetails", "ProductWarehouseBin_ListAll_New", "WarehouseBin_ListAll"]);
+const SOAP_READS = new Set(["GetCurrentUser", "ProductKit_GetKitDetails", "ProductKit_ListKitItems", "ProductWarehouseBin_ListAll_New", "WarehouseBin_ListAll"]);
 const SOAP_ASSEMBLE = "ProductKit_Assemble_New_4";
 const SOAP_DISASSEMBLE = "ProductKit_Disassemble_New3";
 // Removes the small 0.1 leftover from the From bin after an assembly (found on Shragy's server via /soapops?q=bin).
 const SOAP_ADJUST = "WarehouseBin_AdjustQtyByName_WithReason";
+// Nov 23: changing a kit part's qty on a kit with stock. The Kits import re-adds the part, and Sellercloud refuses that on a
+// kit with stock ("Please remove inventory before you add new item in kit", job 2398511); editing the qty by hand in the
+// Kit tab works (his test on Kisses Dark Chocolate Purple 1lb with 400 in stock). Sellercloud's SOAP has no "edit part"
+// call (/soapops?q=^ProductKit), so: AddKitItem for the part the kit already has, with its own Sequence and main flag and
+// the new qty, then read the kit back. Remove only fixes a doubled row that AddKitItem itself made.
+const SOAP_KIT_ADD = "ProductKit_AddKitItem";
+const SOAP_KIT_REMOVE = "ProductKit_RemoveKitItem";
 
 async function soapCall(env, op, bodyXml) {
-  const stockOp = op === SOAP_ASSEMBLE || op === SOAP_DISASSEMBLE || op === SOAP_ADJUST;
+  const stockOp = op === SOAP_ASSEMBLE || op === SOAP_DISASSEMBLE || op === SOAP_ADJUST || op === SOAP_KIT_ADD || op === SOAP_KIT_REMOVE;
   if (!SOAP_READS.has(op) && !stockOp) throw new HttpError(500, `SOAP call ${op} is not allowed.`);
   if (stockOp && !assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off.");
   if (!env.SC_USERNAME || !env.SC_PASSWORD) throw new HttpError(500, "SC_USERNAME or SC_PASSWORD is not set.");
@@ -2418,6 +2425,11 @@ async function mixSetupStep(env, body) {
   if (fk) {
     if (!fk.want || fk.want.parts.some((w) => !Number.isInteger(w.perKit) || w.perKit < 1)) return reply({ saved: false, error: "A kit qty isn't a whole number.", plan });
     const kit = plan.final.sku, change = fk.state === "to change";
+    if (change) {
+      const e = await editKitParts(env, kit, fk.want.parts.map((w) => ({ sku: w.sku, perKit: w.perKit })), "Recipe for this mix run");
+      if (e.ok) return reply({ saved: false, continue: true, message: `Changed ${kit}'s recipe in Sellercloud (${fk.summary.replace(/^Set (the )?kit recipe (to )?/, "").replace(/\.$/, "")}).`, plan });
+      if (e.error) return reply({ saved: false, critical: !!e.critical, error: `Changing ${kit}'s recipe: ${e.error} Nothing was broken down or assembled.`, plan });
+    }
     const sent = await sendKitRows(env, fk.want.parts.map((w) => ({ kit, part: w.sku, perKit: w.perKit })), change);
     if (sent.error) return reply({ saved: false, error: `${change ? "Changing" : "Setting"} ${kit}'s recipe: ${sent.error}`, plan });
     await recSet("kitjob", kit, { jobId: sent.jobId, at: Date.now(), parts: fk.want.parts, overwrite: change }, state);
@@ -3023,6 +3035,11 @@ async function setupStep(env, body) {
     }
     return reply({ saved: false, continue: true, message: `Took ${emptyStep.total} of ${r.kit} out of ${emptyStep.bins.map((e) => "bin " + e.bin).join(", ")} to set its kit. It goes back right after.`, plan });
   }
+  if (r.change) {
+    const e = await editKitParts(env, r.kit, [{ sku: r.part, perKit: r.perKit }], `Recipe for this run (${tag})`);
+    if (e.ok) return reply({ saved: false, continue: true, message: `Changed ${r.kit}'s recipe in Sellercloud: ${r.change.from} → ${r.change.to} ${r.part} per kit.`, plan });
+    if (e.error) return reply({ saved: false, critical: !!e.critical, error: `Changing ${r.kit}'s recipe: ${e.error} Nothing was broken down or assembled.`, plan });
+  }
   const sent = await sendKit(env, { kit: r.kit, part: r.part, perKit: r.perKit }, !!r.change);
   if (sent.error) return reply({ saved: false, error: `${r.change ? "Changing" : "Setting"} ${r.kit}${r.change ? "'s recipe" : ""}: ${sent.error}`, plan });
   await recSet("kitjob", r.kit, { jobId: sent.jobId, at: Date.now(), part: r.part, perKit: r.perKit, overwrite: !!r.change }, state);
@@ -3050,6 +3067,102 @@ async function sendKit(env, r, overwrite = false) {
   const j = await kitJob(env, jobId).catch(() => ({}));
   if (j.error) return { jobId, error: `Sellercloud said: ${String(j.error).slice(0, 300)}` };
   return { jobId };
+}
+
+// A kit's part rows with Sellercloud's own Sequence and main flag (ProductKit_ListKitItems, then GetKitDetails). Read-only.
+// [{ sku, qty, seq, main }]; seq/main are null when Sellercloud's reply doesn't carry them.
+async function kitRows(env, kit) {
+  const rowsOf = (xml) => {
+    const out = [];
+    const walk = (n) => {
+      const sku = kid(n, "KitProductId", "KitProductID", "ChildProductId", "ChildProductID", "ChildSKU");
+      const qty = kid(n, "KitQty", "Qty", "Quantity");
+      if (sku && qty != null) {
+        const seq = kid(n, "Sequence"), main = kid(n, "IsMainItem", "IsMain");
+        out.push({ sku, qty: Number(qty) || 0, seq: seq != null && /^-?\d+$/.test(seq) ? Number(seq) : null,
+          main: main == null ? null : /^(true|1)$/i.test(main) });
+        return;
+      }
+      n.kids.forEach(walk);
+    };
+    walk(xmlTree(xml));
+    return out.filter((r) => r.qty > 0);
+  };
+  let rows = [];
+  try { rows = rowsOf(await soapCall(env, "ProductKit_ListKitItems", `<MainProductID>${xmlEsc(kit)}</MainProductID>`)); } catch {}
+  if (!rows.length || rows.some((r) => r.seq == null || r.main == null)) {
+    const d = rowsOf(await soapCall(env, "ProductKit_GetKitDetails", `<KitParentProductID>${xmlEsc(kit)}</KitParentProductID>`));
+    if (!rows.length) rows = d;
+    else for (const r of rows) {
+      const m = d.find((x) => x.sku.toLowerCase() === r.sku.toLowerCase());
+      if (m) { if (r.seq == null) r.seq = m.seq; if (r.main == null) r.main = m.main; }
+    }
+  }
+  return rows;
+}
+const addKitXml = async (env, kit, row, qty, note) => (await wsdlBody(env, SOAP_KIT_ADD, {
+  MainProductID: kit, KitProductId: row.sku, KitQty: qty,
+  // Our own import set Sequence 1 on every kit it made; no main flag (false).
+  Sequence: row.seq ?? 1, IsMainItem: row.main ? "true" : "false",
+}, note)).xml;
+const soapFalse = (xml, op) => /^false$/i.test(String(tag1(xml, op + "Result") ?? "").trim());
+
+// Changes the qty of parts a kit already has, then reads the kit back until it shows exactly `want` (same parts, new
+// qtys). Never adds a new part or drops one: a recipe with a new or missing part goes through the import.
+// { unsupported } when the parts differ; { ok, got } or { error, got } otherwise.
+async function editKitParts(env, kit, want, note) {
+  const lc = (x) => String(x).toLowerCase();
+  const same = (a, b) => a.length === b.length && b.every((w) => a.some((c) => lc(c.sku) === lc(w.sku)));
+  const exact = (got) => same(got, want) && want.every((w) => got.find((x) => lc(x.sku) === lc(w.sku)).perKit === w.perKit);
+  const show = (got) => got.map((x) => `${x.perKit} ${x.sku}`).join(" + ") || "no parts";
+  const readBack = async (tries) => {
+    let got = [];
+    for (let i = 0; i < tries; i++) {
+      if (i) await sleep(3000);
+      got = await kitRecipe(env, kit);
+      if (exact(got)) return { ok: true, got };
+    }
+    return { got };
+  };
+  const cur = await kitRecipe(env, kit);
+  if (!same(cur, want)) return { unsupported: true, reason: "parts differ" };
+  if (exact(cur)) return { ok: true, got: cur };
+  const rows = await kitRows(env, kit);
+  const kitInt = (await opFields(env, SOAP_KIT_ADD).catch(() => [])).find((f) => f.name === "KitQty");
+  if (kitInt && /^(int|long|short)$/i.test(kitInt.type) && want.some((w) => !Number.isInteger(w.perKit)))
+    return { error: `Sellercloud takes whole numbers per kit, and this run needs ${want.map((w) => w.perKit).join(", ")}.`, got: cur };
+  const changed = [];
+  for (const w of want) {
+    const c = cur.find((x) => lc(x.sku) === lc(w.sku));
+    if (c.perKit === w.perKit) continue;
+    const row = rows.find((x) => lc(x.sku) === lc(c.sku)) || { sku: c.sku, seq: null, main: null };
+    let xml;
+    try { xml = await soapCall(env, SOAP_KIT_ADD, await addKitXml(env, kit, row, w.perKit, note)); }
+    catch (e) { return { error: `Sellercloud refused the new qty for ${c.sku}: ${e.message}${changed.length ? ` (already changed: ${changed.join(", ")})` : ""}`, got: await kitRecipe(env, kit).catch(() => []) }; }
+    if (soapFalse(xml, SOAP_KIT_ADD)) return { error: `Sellercloud answered "false" to the new qty for ${c.sku}.`, got: await kitRecipe(env, kit).catch(() => []) };
+    changed.push(c.sku);
+    // Sellercloud may update the row or add a second row for the same part. Look before the next part.
+    const now = await kitRecipe(env, kit);
+    const dup = now.filter((x) => lc(x.sku) === lc(c.sku)).length > 1;
+    if (dup) {
+      // AddKitItem doubled the part. Remove that part's rows and add it once with the new qty.
+      await soapCall(env, SOAP_KIT_REMOVE, (await wsdlBody(env, SOAP_KIT_REMOVE, { MainProductID: kit, KitProductId: c.sku }, note)).xml);
+      await sleep(1500);
+      const after = await kitRecipe(env, kit);
+      const left = after.filter((x) => lc(x.sku) === lc(c.sku));
+      if (left.length > 1) return { error: `${kit} still has ${c.sku} more than once after removing the extra row.`, got: after };
+      if (left.length === 1 && left[0].perKit !== w.perKit) return { error: `${kit} has ${c.sku} at ${left[0].perKit} per kit after removing the extra row, not ${w.perKit}.`, got: after };
+      if (!left.length) {
+        let x2;
+        try { x2 = await soapCall(env, SOAP_KIT_ADD, await addKitXml(env, kit, row, w.perKit, note)); }
+        catch (e) { return { error: `IMPORTANT: ${kit} has no ${c.sku} row now. Sellercloud refused adding it back at ${w.perKit} per kit: ${e.message} Add it in its Kit tab.`, got: after, critical: true }; }
+        if (soapFalse(x2, SOAP_KIT_ADD)) return { error: `IMPORTANT: ${kit} has no ${c.sku} row now; Sellercloud answered "false" to adding it back at ${w.perKit} per kit. Add it in its Kit tab.`, got: after, critical: true };
+      }
+    }
+  }
+  const r = await readBack(8);
+  if (r.ok) return r;
+  return { error: `${kit} reads back as ${show(r.got)} after the change.`, got: r.got };
 }
 
 // An assembly record for one group: none, confirmed, pending (sent, Sellercloud not showing it yet) or bad.
