@@ -99,7 +99,7 @@
 //     GET  /assemble/jobs[?active=1]   every job (active=1: running, waiting, or finished and not acked yet).
 //     POST /assemble/job/cancel {itemId|jobId}   only before it starts.   POST /assemble/job/ack {jobIds}   board written.
 //   /soapops?type=Name                          the fields of one SOAP data type and their types (read-only)
-//   /kittool?sku=KIT                            read-only: tries the web Kit tab's KitTool/Load with the worker's REST token
+//   /kittool?sku=KIT                            read-only probe: how the web Kit tab's host (delta) signs in; KitTool/Load only
 //   /cachecheck                                 whether the worker's saved-step memory works on this address (read-only)
 //   /assemblediag[?part=calls|send|stock|rest&sku=FINAL&fromBin=&toBin=] read-only assemble checks, one light part per call                 read-only: every Sellercloud assemble call and its fields, kit part fields,
 //                                   the Kits import columns, kit/assemble API endpoints, the kit's parts as Sellercloud stores them,
@@ -3374,43 +3374,66 @@ async function produceProduction(env, body) {
 // Lists the SOAP service's operations (from its own WSDL) whose name matches q, with their inputs.
 // Read-only: it only downloads the service description.
 // The web Kit tab saves through a JSON call on the "delta" host (KitTool/Save), signed by the web session cookie.
-// This tries only its read twin, KitTool/Load, with the worker's REST Bearer token: on the delta host, then on the
-// REST host. Never follows a redirect (a redirect to sign-in means the token isn't accepted there). Read-only.
+// Read-only probe (Nov 23) of how delta signs in, using only the worker's own Sellercloud login. Never calls Save and never
+// follows a redirect. Shows statuses, the auth scheme delta asks for, redirect paths and cookie NAMES only: no token,
+// cookie or password value is ever shown.
 async function kitToolLoadTest(env, sku) {
   const base = await getBase(env);
   const apiHost = new URL(base).hostname;              // e.g. lgd.api.sellercloud.com
   const code = apiHost.split(".")[0];
   const delta = (env.SC_DELTA_URL || `https://${code}.delta.sellercloud.com`).trim().replace(/\/+$/, "");
-  const path = "/api/Toolbox/Product/KitTool/Load";
-  const urls = [delta + path, `https://${apiHost}${path}`, base.replace(/\/api$/i, "") + path];
-  const trim = (v) => JSON.parse(JSON.stringify(v ?? null, (k, x) => (typeof x === "string" && x.length > 600 ? x.slice(0, 600) + "…" : x)));
-  const out = { sku, tried: [] };
-  for (const u of [...new Set(urls)]) {
-    const row = { url: u };
-    try {
-      const token = await getToken(env, base);
-      subrequests++; scCalls++;
-      const r = await fetch(u, {
-        method: "POST", redirect: "manual",
-        headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
-        body: JSON.stringify({ Id: sku }),
-      });
-      row.status = r.status;
-      row.contentType = r.headers.get("content-type") || "";
-      const loc = r.headers.get("location");
-      if (loc) row.redirectTo = loc.split("?")[0];
+  const loadUrl = delta + "/api/Toolbox/Product/KitTool/Load";
+  const cookieNames = (r) => {
+    const all = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [r.headers.get("set-cookie") || ""].filter(Boolean);
+    return all.map((c) => c.split("=")[0].trim()).filter(Boolean);
+  };
+  const trim = (v) => JSON.parse(JSON.stringify(v ?? null, (k, x) => (typeof x === "string" && x.length > 400 ? x.slice(0, 400) + "…" : x)));
+  const short = (text) => { try { return trim(JSON.parse(text)); } catch { return text.replace(/\s+/g, " ").slice(0, 300); } };
+  const info = (r) => ({ status: r.status, contentType: r.headers.get("content-type") || "",
+    wwwAuthenticate: r.headers.get("www-authenticate") || undefined,
+    redirectTo: r.headers.get("location") ? r.headers.get("location").split("?")[0] : undefined,
+    setsCookies: cookieNames(r) });
+  const hit = async (u, init) => { subrequests++; scCalls++; return fetch(u, { redirect: "manual", ...init }); };
+  const load = async (headers) => {
+    const r = await hit(loadUrl, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json", "X-Requested-With": "XMLHttpRequest", ...headers }, body: JSON.stringify({ Id: sku }) });
+    const text = await r.text();
+    let body = null; try { body = JSON.parse(text); } catch {}
+    const dto = body?.Data?.DTO || body?.Data?.Dto || null;
+    return { ...info(r), works: r.ok && !!dto, items: dto ? (dto.Items || []).map((i) => ({ part: i.ChildProductID, qty: i.Qty, isMain: i.IsMainItem })) : undefined, reply: dto ? undefined : short(text) };
+  };
+  const out = { sku, delta, tries: [] };
+  const step = async (name, fn) => { const row = { try: name }; try { Object.assign(row, await fn()); } catch (e) { row.error = e.message; } out.tries.push(row); return row; };
+  const restToken = await getToken(env, base);
+
+  // 1. REST token as Bearer (shows the auth scheme delta asks for).
+  const t1 = await step("Load with the REST token as Bearer", () => load({ Authorization: "Bearer " + restToken }));
+  if (t1.works) return { ...out, works: true, how: "rest-bearer" };
+  // 2. Where delta sends a browser that isn't signed in (sign-in page path, cookie names).
+  await step("Open delta's home page (not signed in)", async () => info(await hit(delta + "/", { method: "GET" })));
+  // 3. A token sign-in on delta with the worker's existing login (same shape as the REST sign-in). Status only.
+  for (const path of ["/api/token", "/rest/api/token"]) {
+    let tok = null;
+    const row = await step(`Sign in at delta ${path}`, async () => {
+      const r = await hit(delta + path, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ Username: env.SC_USERNAME, Password: env.SC_PASSWORD }) });
       const text = await r.text();
-      let body = null;
-      try { body = JSON.parse(text); } catch { body = text.replace(/\s+/g, " ").slice(0, 600); }
-      const dto = body && typeof body === "object" ? (body.Data?.DTO || body.Data?.Dto || null) : null;
-      row.works = r.ok && !!dto;
-      if (dto) row.items = (dto.Items || []).map((i) => ({ part: i.ChildProductID, qty: i.Qty, isMain: i.IsMainItem, rowStatus: i.RowStatus }));
-      row.reply = trim(body);
-    } catch (e) { row.error = e.message; }
-    out.tried.push(row);
-    if (row.works) break;
+      let j = null; try { j = JSON.parse(text); } catch {}
+      tok = j?.access_token || j?.token || j?.Token || null;
+      return { ...info(r), gotToken: !!tok, replyKeys: j && typeof j === "object" ? Object.keys(j) : undefined, reply: tok || r.ok ? undefined : short(text) };
+    });
+    if (tok) {
+      const t = await step(`Load with the token from ${path} as Bearer`, () => load({ Authorization: "Bearer " + tok }));
+      if (t.works) return { ...out, works: true, how: "delta-token " + path };
+    }
+    if (row.status && row.status !== 404) break; // that path exists; no need to try the other
   }
-  out.works = out.tried.some((t) => t.works);
+  // 4. The REST token in the cookies delta itself sets, if any are named like a token or auth cookie.
+  const names = [...new Set(out.tries.flatMap((t) => t.setsCookies || []))].filter((n) => /token|auth|jwt|bearer/i.test(n));
+  for (const n of names.slice(0, 3)) {
+    const t = await step(`Load with the REST token in cookie ${n}`, () => load({ Cookie: `${n}=${restToken}` }));
+    if (t.works) return { ...out, works: true, how: "cookie " + n };
+  }
+  out.works = false;
   return out;
 }
 
