@@ -67,6 +67,9 @@
 //   time (bin list 10 min, catalog and kit parts 1 min, stock and bin qty 15 s); add &fresh=1 to read Sellercloud now.
 //   POST /assemble {sku,qty,itemId,fromBin,toBin[,source,perKit]}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //   /assemble/kit?sku=SKU          (ASSEMBLE_KEY) a product's kit parts and qty per kit (read-only)
+//   Live-board copy (Nov 24): every 5 minutes (cron */5) reads the live Production Schedule (READ ONLY) and copies its
+//     open productions (group Production Schedule, not Done) to the Hub board 18439411777; Text MIRROR_ENABLED = yes turns
+//     it on. GET /mirror/status (ASSEMBLE_KEY or APP_KEY). Writes only to the Hub board, through mirrorMutate.
 //   Labels (Nov 24; nothing calls Sellercloud): POST /labels/upload (multipart file + data JSON; header X-Labels-Key =
 //     Secret LABELS_KEY, 501 until it's set); GET /labels/batches?from=&to=, /labels/batch?batchId=, /labels/file?batchId=,
 //     /labels/stats?from=&to=&groupBy=day|week|month, POST /labels/downloaded {batchId,by} (ASSEMBLE_KEY or APP_KEY).
@@ -3426,6 +3429,13 @@ async function handle(request, env) {
     if (request.method !== "POST") return json({ error: "Use POST for /labels/upload." }, 405);
     return labelsUpload(request, env);
   }
+  if (p0 === "/mirror/status") {
+    if (request.method !== "GET") return json({ error: "Only GET is allowed here." }, 405);
+    const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
+    const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
+    if (!ok) return json({ error: "Missing or wrong key." }, 401);
+    return json(await mirrorStatus(env));
+  }
   if (p0.startsWith("/labels/")) {
     const wantPost = p0 === "/labels/downloaded";
     if (request.method !== (wantPost ? "POST" : "GET")) return json({ error: wantPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
@@ -4339,8 +4349,323 @@ export class LabelStore {
   }
 }
 
+// ---- Live-board copy (Nov 24, Shragy: "can we do something for now that all the products in production schedule also go
+// onto this production hub untill we make the full switch over ?", "only productions that are not started or in progress
+// not anyhting done already", and he picked "Just the 43"). One way only: the live Production Schedule is READ, the Hub
+// board gets the copies. Every write goes through mirrorMutate, which only writes to the Hub board and its items.
+const MIRROR_LIVE = "18410399966"; // READ ONLY
+const MIRROR_HUB = "18439411777";
+const MIRROR_CRON = "*/5 * * * *";
+const MIRROR_MAP = "mirror:map";
+const MIRROR_LOCK = "mirror:lock";
+const MIRROR_LAST = "mirror:lastrun";
+const MC = {
+  status: "color_mm2tx0ce", liveRef: "text_mm9dhzy5", qtyProduced: "numeric_mm2tdq3c",
+  shipmentId: "long_text_mm33g5nb", fbaLocation: "text_mm3590jg",
+};
+const MIRROR_GROUP = { live: "topics", hubCopy: "topics", hubNew: "group_mm97fda1", hubCompleted: "group_mm98anpr" };
+// Synced live -> Hub when the LIVE value changes. type decides how the value is written.
+const MIRROR_COLS = [
+  ["text_mm2tm45r", "text"], ["numeric_mm2tqrq1", "numbers"], ["color_mm2tsp4x", "status"], ["color_mm2twbx1", "status"],
+  ["color_mm2t69jg", "status"], ["date_mm2t81sa", "date"], ["numeric_mm3a7yka", "numbers"], ["color_mm2vam8n", "status"],
+  ["date_mm2tdw74", "date"], ["color_mm2tyghr", "status"], ["numeric_mm2tdq3c", "numbers"], ["text_mm2t9k42", "text"],
+  ["date_mm2t70kb", "date"], ["numeric_mm3bpfja", "numbers"], ["text_mm3bt14h", "text"], ["numeric_mm3b1zth", "numbers"],
+];
+const MIRROR_ONCE = [[MC.shipmentId, "long_text"], [MC.fbaLocation, "text"]];
+const MIRROR_FILES = ["file_mm2tnx4a", "file_mm2tgk84", "file_mm2t70h5"];
+const MIRROR_EARLY = new Set(["Unassigned", "Assigned", "Queued", "Next Up Manual", "Next Up Machine"]);
+const mirrorOn = (env) => String(env.MIRROR_ENABLED || "").trim().toLowerCase() === "yes";
+const mirrorSkip = (env) => new Set(String(env.MIRROR_SKIP ?? "13598232255").split(",").map((x) => x.trim()).filter(Boolean));
+
+// Live board: reads only. Refuses anything that isn't a query.
+async function liveRead(env, query, variables) {
+  if (/\bmutation\b/i.test(query)) throw new Error("Refused: the live board is read only.");
+  return mondayApi(env, query, variables);
+}
+// Hub board: the only way the copy writes. kind: create | change | move | file.
+async function mirrorMutate(env, ctx, kind, a) {
+  if (ctx.calls >= ctx.maxCalls) throw Object.assign(new Error("call budget used"), { budget: true });
+  const okItem = (id) => /^\d+$/.test(String(id)) && ctx.hubIds.has(String(id)) && !ctx.liveIds.has(String(id));
+  let q, v;
+  if (kind === "create") {
+    q = `mutation($b:ID!,$g:String!,$n:String!,$c:JSON!){ create_item(board_id:$b, group_id:$g, item_name:$n, column_values:$c, create_labels_if_missing:false){ id } }`;
+    v = { b: MIRROR_HUB, g: a.group, n: a.name, c: JSON.stringify(a.cols) };
+  } else if (kind === "change") {
+    if (!okItem(a.itemId)) throw new Error(`Refused: ${a.itemId} isn't a Hub board item.`);
+    q = `mutation($b:ID!,$i:ID!,$c:JSON!){ change_multiple_column_values(board_id:$b, item_id:$i, column_values:$c, create_labels_if_missing:false){ id } }`;
+    v = { b: MIRROR_HUB, i: String(a.itemId), c: JSON.stringify(a.cols) };
+  } else if (kind === "move") {
+    if (!okItem(a.itemId)) throw new Error(`Refused: ${a.itemId} isn't a Hub board item.`);
+    q = `mutation($i:ID!,$g:String!){ move_item_to_group(item_id:$i, group_id:$g){ id board{ id } } }`;
+    v = { i: String(a.itemId), g: a.group };
+  } else if (kind === "file") {
+    if (!okItem(a.itemId) || !MIRROR_FILES.includes(a.column)) throw new Error(`Refused: ${a.itemId} isn't a Hub board item.`);
+    ctx.calls++; countFetch();
+    const fd = new FormData();
+    fd.append("query", `mutation ($file: File!) { add_file_to_column (item_id: ${String(a.itemId)}, column_id: "${a.column}", file: $file) { id } }`);
+    fd.append("variables[file]", a.blob, a.name);
+    const r = await fetch("https://api.monday.com/v2/file", { method: "POST", headers: { Authorization: env.MONDAY_TOKEN }, body: fd });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.errors || d.error_message) throw new Error("monday file upload: " + JSON.stringify(d.errors || d.error_message || r.status).slice(0, 200));
+    return d.data;
+  } else throw new Error("Refused: unknown write.");
+  if (JSON.stringify(v).includes(MIRROR_LIVE)) throw new Error("Refused: that write names the live board.");
+  ctx.calls++;
+  const d = await mondayApi(env, q, v);
+  if (kind === "create") ctx.hubIds.add(String(d.create_item.id));
+  await sleep(250);
+  return d;
+}
+
+// A live column as stored in `last` (compared each run) and as written to the Hub.
+function mirrorVal(cv, type) {
+  if (!cv) return "";
+  if (type === "date") { try { const j = JSON.parse(cv.value || "null"); return j?.date ? (j.time ? `${j.date} ${j.time}` : j.date) : ""; } catch { return ""; } }
+  return (cv.text || "").trim();
+}
+function mirrorWriteVal(type, val) {
+  if (val === "" || val == null) return "";
+  if (type === "status") return { label: val };
+  if (type === "date") { const [date, time] = val.split(" "); return time ? { date, time } : { date }; }
+  if (type === "long_text") return { text: val };
+  return val; // text, numbers
+}
+const mirrorAssets = (cv) => { try { return (JSON.parse(cv?.value || "null")?.files || []).map((f) => String(f.assetId)).filter((x) => x && x !== "undefined"); } catch { return []; } };
+
+async function mirrorHubLabels(env) {
+  const d = await mondayApi(env, `query($b:[ID!]){ boards(ids:$b){ columns{ id type settings_str } } }`, { b: [MIRROR_HUB] });
+  const out = {};
+  for (const c of d.boards?.[0]?.columns || []) {
+    if (c.type !== "status") continue;
+    try { out[c.id] = new Set(Object.values(JSON.parse(c.settings_str || "{}").labels || {}).filter(Boolean)); } catch { out[c.id] = new Set(); }
+  }
+  return out;
+}
+const LIVE_COL_IDS = [MC.status, ...MIRROR_COLS.map((c) => c[0]), ...MIRROR_ONCE.map((c) => c[0]), ...MIRROR_FILES];
+async function mirrorLiveScope(env) {
+  const items = [];
+  let cursor = null, first = true;
+  while (first || cursor) {
+    const d = first
+      ? await liveRead(env, `query($b:[ID!],$g:[String],$c:[String!]){ boards(ids:$b){ groups(ids:$g){ items_page(limit:100){ cursor items{ id name state group{ id } column_values(ids:$c){ id text value } } } } } }`,
+        { b: [MIRROR_LIVE], g: [MIRROR_GROUP.live], c: LIVE_COL_IDS })
+      : await liveRead(env, `query($cur:String!,$c:[String!]){ next_items_page(limit:100, cursor:$cur){ cursor items{ id name state group{ id } column_values(ids:$c){ id text value } } } }`,
+        { cur: cursor, c: LIVE_COL_IDS });
+    const page = first ? d.boards?.[0]?.groups?.[0]?.items_page : d.next_items_page;
+    if (!page) break;
+    items.push(...page.items);
+    cursor = page.cursor; first = false;
+  }
+  return items;
+}
+async function mirrorLiveByIds(env, ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 100) {
+    const d = await liveRead(env, `query($i:[ID!],$c:[String!]){ items(ids:$i, limit:100){ id name state board{ id } group{ id } column_values(ids:$c){ id text value } } }`,
+      { i: ids.slice(i, i + 100), c: LIVE_COL_IDS });
+    out.push(...(d.items || []).filter((x) => String(x.board?.id) === MIRROR_LIVE));
+  }
+  return out;
+}
+// Every Hub item (all groups) with its live-item tag, status and group.
+async function mirrorHubItems(env) {
+  const items = [];
+  let cursor = null, first = true;
+  const c = [MC.liveRef, MC.status];
+  while (first || cursor) {
+    const d = first
+      ? await mondayApi(env, `query($b:[ID!],$c:[String!]){ boards(ids:$b){ items_page(limit:500){ cursor items{ id state group{ id } column_values(ids:$c){ id text } } } } }`, { b: [MIRROR_HUB], c })
+      : await mondayApi(env, `query($cur:String!,$c:[String!]){ next_items_page(limit:500, cursor:$cur){ cursor items{ id state group{ id } column_values(ids:$c){ id text } } } }`, { cur: cursor, c });
+    const page = first ? d.boards?.[0]?.items_page : d.next_items_page;
+    if (!page) break;
+    items.push(...page.items);
+    cursor = page.cursor; first = false;
+  }
+  return items.map((it) => {
+    const cv = Object.fromEntries(it.column_values.map((x) => [x.id, x.text || ""]));
+    return { id: String(it.id), group: it.group?.id || "", status: cv[MC.status] || "", liveRef: (cv[MC.liveRef] || "").trim() };
+  });
+}
+// Items that items_page didn't return: really gone, or only archived/deleted?
+async function mirrorHubStates(env, ids) {
+  const out = {};
+  for (let i = 0; i < ids.length; i += 100) {
+    const d = await mondayApi(env, `query($i:[ID!]){ items(ids:$i, limit:100){ id state board{ id } } }`, { i: ids.slice(i, i + 100) });
+    for (const x of d.items || []) if (String(x.board?.id) === MIRROR_HUB) out[String(x.id)] = x.state;
+  }
+  return out;
+}
+
+async function mirrorCopyFiles(env, ctx, rec, hubId, cvs, log) {
+  rec.files = rec.files || {};
+  for (const col of MIRROR_FILES) {
+    const want = mirrorAssets(cvs[col]);
+    const done = new Set(rec.files[col] || []);
+    const todo = want.filter((x) => !done.has(x));
+    if (!todo.length) continue;
+    const d = await liveRead(env, `query($i:[ID!]!){ assets(ids:$i){ id name public_url file_size } }`, { i: todo });
+    for (const a of d.assets || []) {
+      if (ctx.calls + 3 > ctx.maxCalls || Date.now() > ctx.until) return false;
+      if (Number(a.file_size) > 25 * 1024 * 1024) { log.push(`skipped ${a.name} (over 25 MB) on live ${rec.liveId}`); done.add(String(a.id)); continue; }
+      ctx.calls++; countFetch();
+      const r = await fetch(a.public_url);
+      if (!r.ok) { log.push(`couldn't download ${a.name} for live ${rec.liveId} (${r.status})`); continue; }
+      const blob = await r.blob();
+      await mirrorMutate(env, ctx, "file", { itemId: hubId, column: col, blob, name: a.name || "file" });
+      done.add(String(a.id));
+      ctx.counts.files++;
+    }
+    rec.files[col] = [...done];
+  }
+  return true;
+}
+
+async function runMirror(env) {
+  if (!mirrorOn(env) || !env.TOKEN_KV || !env.MONDAY_TOKEN) return { skipped: "off" };
+  const held = await env.TOKEN_KV.get(MIRROR_LOCK);
+  if (held && Number(held) > Date.now()) return { skipped: "another run is going" };
+  await env.TOKEN_KV.put(MIRROR_LOCK, String(Date.now() + 5 * 60_000), { expirationTtl: 360 });
+  const started = Date.now();
+  const ctx = { calls: 0, maxCalls: parseInt(env.MIRROR_MAX_CALLS || "350", 10) || 350, until: started + 200_000,
+    hubIds: new Set(), liveIds: new Set(), counts: { created: 0, updated: 0, done: 0, left: 0, deleted: 0, adopted: 0, files: 0, errors: 0 } };
+  const log = [];
+  let map = {};
+  try {
+    map = (await env.TOKEN_KV.get(MIRROR_MAP, "json")) || {};
+    const skip = mirrorSkip(env);
+    const labels = await mirrorHubLabels(env);
+    const hub = await mirrorHubItems(env);
+    for (const h of hub) ctx.hubIds.add(h.id);
+    const hubById = new Map(hub.map((h) => [h.id, h]));
+    const hubByLive = new Map(hub.filter((h) => h.liveRef).map((h) => [h.liveRef, h]));
+    const scope = await mirrorLiveScope(env);
+    for (const it of scope) ctx.liveIds.add(String(it.id));
+    const inScope = new Map();
+    for (const it of scope) {
+      const cvs = Object.fromEntries(it.column_values.map((x) => [x.id, x]));
+      if (it.state && it.state !== "active") continue;
+      if (skip.has(String(it.id))) continue;
+      if (mirrorVal(cvs[MC.status], "status") === "Done") continue;
+      inScope.set(String(it.id), { it, cvs });
+    }
+    // Active copies whose live item isn't in scope now: Done, moved, or gone.
+    const missing = Object.values(map).filter((r) => r.state === "active" && !inScope.has(r.liveId)).map((r) => r.liveId);
+    const elsewhere = new Map((await mirrorLiveByIds(env, missing)).map((x) => { ctx.liveIds.add(String(x.id)); return [String(x.id), x]; }));
+    // Copies missing from the Hub board: deleted or archived there (never recreated).
+    const gone = Object.values(map).filter((r) => ["active", "left", "done"].includes(r.state) && r.testId && !hubById.has(r.testId)).map((r) => r.testId);
+    const hubStates = gone.length ? await mirrorHubStates(env, gone) : {};
+
+    const setCols = (cvs, list, last, onlyChanged) => {
+      const cols = {};
+      for (const [id, type] of list) {
+        const val = mirrorVal(cvs[id], type);
+        if (onlyChanged && last && last[id] === val) continue;
+        if (type === "status" && val && labels[id] && !labels[id].has(val)) { log.push(`label "${val}" isn't on the Hub's ${id}; left empty`); continue; }
+        cols[id] = mirrorWriteVal(type, val);
+      }
+      return cols;
+    };
+    const lastOf = (it, cvs) => {
+      const l = { name: it.name, [MC.status]: mirrorVal(cvs[MC.status], "status") };
+      for (const [id, type] of MIRROR_COLS) l[id] = mirrorVal(cvs[id], type);
+      return l;
+    };
+
+    // 1. Copies that left the Hub board.
+    for (const r of Object.values(map)) {
+      if (r.testId && !hubById.has(r.testId) && ["active", "left", "done"].includes(r.state)) {
+        const s = hubStates[r.testId];
+        if (s === "active") continue; // still there (another page), leave it
+        r.state = "deleted"; r.updatedAt = new Date().toISOString(); ctx.counts.deleted++;
+      }
+    }
+    // 2. Active copies whose live item is out of scope.
+    for (const r of Object.values(map).filter((x) => x.state === "active" && !inScope.has(x.liveId))) {
+      const x = elsewhere.get(r.liveId);
+      const cvs = x ? Object.fromEntries(x.column_values.map((c) => [c.id, c])) : {};
+      const liveStatus = x ? mirrorVal(cvs[MC.status], "status") : "";
+      try {
+        if (x && x.state === "active" && liveStatus === "Done") {
+          const h = hubById.get(r.testId);
+          if (h && (h.group === MIRROR_GROUP.hubCopy || h.group === MIRROR_GROUP.hubNew) && h.status !== "Done") {
+            const cols = { [MC.status]: { label: "Done" } };
+            const qp = mirrorVal(cvs[MC.qtyProduced], "numbers");
+            if (qp) cols[MC.qtyProduced] = qp;
+            await mirrorMutate(env, ctx, "change", { itemId: r.testId, cols });
+            await mirrorMutate(env, ctx, "move", { itemId: r.testId, group: MIRROR_GROUP.hubCompleted });
+          }
+          r.state = "done"; ctx.counts.done++;
+        } else { r.state = "left"; ctx.counts.left++; }
+        r.updatedAt = new Date().toISOString();
+      } catch (e) { if (e.budget) break; ctx.counts.errors++; log.push(`live ${r.liveId}: ${e.message}`); }
+    }
+    // 3. Items in scope: update copies, create new ones.
+    for (const [liveId, { it, cvs }] of inScope) {
+      if (Date.now() > ctx.until || ctx.calls >= ctx.maxCalls) { log.push("stopped early (time or call budget); the next run carries on"); break; }
+      let r = map[liveId];
+      if (r && (r.state === "deleted" || r.state === "left" || r.state === "done")) continue;
+      try {
+        if (!r) {
+          const adopt = hubByLive.get(liveId);
+          if (adopt) {
+            r = map[liveId] = { liveId, testId: adopt.id, state: "active", last: lastOf(it, cvs), files: {}, createdAt: new Date().toISOString(), adopted: true };
+            ctx.counts.adopted++;
+          } else {
+            const liveStatus = mirrorVal(cvs[MC.status], "status");
+            const cols = { ...setCols(cvs, MIRROR_COLS, null, false), ...setCols(cvs, MIRROR_ONCE, null, false), [MC.liveRef]: liveId,
+              [MC.status]: { label: liveStatus === "In Progress" ? "Started" : "Unassigned" } };
+            for (const k of Object.keys(cols)) if (cols[k] === "") delete cols[k];
+            const d = await mirrorMutate(env, ctx, "create", { group: MIRROR_GROUP.hubCopy, name: it.name, cols });
+            const testId = String(d.create_item.id);
+            r = map[liveId] = { liveId, testId, name: it.name, state: "active", last: lastOf(it, cvs), files: {}, createdAt: new Date().toISOString() };
+            hubById.set(testId, { id: testId, group: MIRROR_GROUP.hubCopy, status: cols[MC.status].label, liveRef: liveId });
+            ctx.counts.created++;
+          }
+        } else {
+          const cols = setCols(cvs, MIRROR_COLS, r.last, true);
+          if (r.last.name !== it.name) cols.name = it.name;
+          const liveStatus = mirrorVal(cvs[MC.status], "status");
+          const h = hubById.get(r.testId);
+          if (liveStatus === "In Progress" && r.last[MC.status] !== "In Progress" && h && MIRROR_EARLY.has(h.status)) cols[MC.status] = { label: "Started" };
+          if (Object.keys(cols).length) { await mirrorMutate(env, ctx, "change", { itemId: r.testId, cols }); ctx.counts.updated++; }
+          r.last = lastOf(it, cvs);
+        }
+        r.name = it.name;
+        await mirrorCopyFiles(env, ctx, r, r.testId, cvs, log);
+        r.updatedAt = new Date().toISOString();
+      } catch (e) {
+        if (e.budget) { log.push("call budget used; the next run carries on"); break; }
+        ctx.counts.errors++; log.push(`live ${liveId}: ${e.message}`);
+      }
+    }
+    await env.TOKEN_KV.put(MIRROR_MAP, JSON.stringify(map));
+    const out = { at: new Date().toISOString(), seconds: Math.round((Date.now() - started) / 1000), inScope: inScope.size, ...ctx.counts, calls: ctx.calls, log: log.slice(0, 50), error: null };
+    await env.TOKEN_KV.put(MIRROR_LAST, JSON.stringify(out));
+    return out;
+  } catch (e) {
+    try { await env.TOKEN_KV.put(MIRROR_MAP, JSON.stringify(map)); } catch {}
+    const out = { at: new Date().toISOString(), ...ctx.counts, calls: ctx.calls, log: log.slice(0, 50), error: e.message };
+    await env.TOKEN_KV.put(MIRROR_LAST, JSON.stringify(out)).catch(() => {});
+    return out;
+  } finally {
+    await env.TOKEN_KV.delete(MIRROR_LOCK).catch(() => {});
+  }
+}
+async function mirrorStatus(env) {
+  const map = (env.TOKEN_KV && (await env.TOKEN_KV.get(MIRROR_MAP, "json"))) || {};
+  const last = env.TOKEN_KV ? await env.TOKEN_KV.get(MIRROR_LAST, "json") : null;
+  const counts = { active: 0, done: 0, left: 0, deleted: 0, skipped: mirrorSkip(env).size };
+  const items = Object.values(map).map((r) => { counts[r.state] = (counts[r.state] || 0) + 1; return { liveId: r.liveId, testId: r.testId, name: r.name || "", state: r.state, updatedAt: r.updatedAt || r.createdAt || null }; });
+  return { enabled: mirrorOn(env), lastRun: last, lastError: last?.error || null, counts, items };
+}
+
 export default {
   async scheduled(event, env, ctx) {
+    // The live-board copy has its own 5-minute timer and does nothing else.
+    if (event && event.cron === MIRROR_CRON) {
+      ctx.waitUntil(runMirror(env).then((r) => console.log("mirror: " + JSON.stringify(r).slice(0, 500))).catch((e) => console.log("mirror failed: " + e.message)));
+      return;
+    }
     callStart = Date.now();
     deadline = callStart + 150_000; // the sync's own time box is 120 s
     readCacheOn = false;
