@@ -67,6 +67,10 @@
 //   time (bin list 10 min, catalog and kit parts 1 min, stock and bin qty 15 s); add &fresh=1 to read Sellercloud now.
 //   POST /assemble {sku,qty,itemId,fromBin,toBin[,source,perKit]}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //   /assemble/kit?sku=SKU          (ASSEMBLE_KEY) a product's kit parts and qty per kit (read-only)
+//   Labels (Nov 24; nothing calls Sellercloud): POST /labels/upload (multipart file + data JSON; header X-Labels-Key =
+//     Secret LABELS_KEY, 501 until it's set); GET /labels/batches?from=&to=, /labels/batch?batchId=, /labels/file?batchId=,
+//     /labels/stats?from=&to=&groupBy=day|week|month, POST /labels/downloaded {batchId,by} (ASSEMBLE_KEY or APP_KEY).
+//     PDFs in KV (TOKEN_KV, labels:file:<batchId>); batches and lines in the SQLite Durable Object LabelStore (binding LABELS).
 //   /assemble/platforms  (ASSEMBLE_KEY) platforms for "Create final SKU": prefix and company each (company: Text PLATFORM_COMPANY_<KEY>)
 //   POST /assemble/create-product {sku,name?,platform? or companyName/companyId,sourceSku?,productType?,itemId?}
 //     (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes) creates ONE product in that company. Refuses an SKU that exists
@@ -3417,6 +3421,19 @@ async function handle(request, env) {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
   const url = new URL(request.url);
   const p0 = url.pathname.replace(/\/+$/, "");
+  // Labels: the label-buying AI uploads with its own key (LABELS_KEY); the Hub reads with its key (ASSEMBLE_KEY or APP_KEY).
+  if (p0 === "/labels/upload") {
+    if (request.method !== "POST") return json({ error: "Use POST for /labels/upload." }, 405);
+    return labelsUpload(request, env);
+  }
+  if (p0.startsWith("/labels/")) {
+    const wantPost = p0 === "/labels/downloaded";
+    if (request.method !== (wantPost ? "POST" : "GET")) return json({ error: wantPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
+    const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
+    const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
+    if (!ok) return json({ error: "Missing or wrong key." }, 401);
+    return labelsRoute(request, env, p0, url);
+  }
   const isAssemble = p0 === "/assemble";
   const isPost = isAssemble || p0 === "/assemble/setup" || p0 === "/assemble/produce" || p0 === "/assemble/refresh" || p0 === "/assemble/clear"
     || p0 === "/assemble/job/cancel" || p0 === "/assemble/job/ack" || p0 === "/assemble/create-product";
@@ -4094,6 +4111,232 @@ async function createFinalProduct(env, body) {
   try { shows = !!(await findProduct(env, sku)); } catch {}
   return { created: true, ...made, showsInCatalog: shows, warnings,
     message: `Created ${sku} in ${co.company}.${shows === false ? " Sellercloud may take a moment to show it." : ""}` };
+}
+
+// ---- Labels (Nov 24, Shragy: "i have a different AI that buys the labels and i want that ai to upload it here in the
+// system for the right employee to download and ship / i also want in this tab a label dashboard which basicly shows
+// how much was spent fro labels and how many we shipped of each product"). Nothing here calls Sellercloud.
+// The PDF of each batch is kept in KV (TOKEN_KV, key labels:file:<batchId>, up to 25 MB); the batch and its lines are
+// kept in a SQLite Durable Object (LabelStore, binding LABELS), so the dashboard can add them up.
+const LABELS_MAX_BYTES = 25 * 1024 * 1024;
+const LABELS_MAX_DAYS = 92;
+const labelFileKey = (id) => "labels:file:" + id;
+const isDay = (d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(Date.parse(d + "T00:00:00Z"));
+const dayShift = (d, n) => new Date(Date.parse(d + "T00:00:00Z") + n * 86400000).toISOString().slice(0, 10);
+function labelsRange(url) {
+  const today = new Date().toISOString().slice(0, 10);
+  const to = url.searchParams.get("to") || today;
+  const from = url.searchParams.get("from") || dayShift(to, -29);
+  if (!isDay(from) || !isDay(to)) throw new HttpError(400, "from and to must be dates like 2026-11-24.");
+  if (from > to) throw new HttpError(400, "from is after to.");
+  if ((Date.parse(to) - Date.parse(from)) / 86400000 + 1 > LABELS_MAX_DAYS) throw new HttpError(400, `Pick at most ${LABELS_MAX_DAYS} days.`);
+  return { from, to };
+}
+async function labelsCall(env, path, body) {
+  if (!env.LABELS) throw new HttpError(501, "Labels aren't switched on yet (the LABELS store isn't deployed).");
+  const stub = env.LABELS.get(env.LABELS.idFromName("labels"));
+  const r = await stub.fetch("https://labels.internal" + path, { method: "POST", body: JSON.stringify(body || {}) });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new HttpError(r.status, data.error || "Labels store error.");
+  return data;
+}
+// Checks the uploaded data; returns { batch, lines, problems }.
+function labelsCheck(d) {
+  const problems = [];
+  const str = (v, max) => (v == null ? "" : String(v)).trim().slice(0, max);
+  if (!d || typeof d !== "object" || Array.isArray(d)) return { problems: ["data must be a JSON object."] };
+  const batchId = str(d.batchId, 200);
+  if (!batchId) problems.push("batchId is required.");
+  else if (!/^[A-Za-z0-9._-]{1,80}$/.test(batchId)) problems.push("batchId may use only letters, digits, dot, dash and underscore, up to 80 characters.");
+  const date = str(d.date, 20);
+  if (!isDay(date)) problems.push("date is required as YYYY-MM-DD.");
+  const list = Array.isArray(d.labels) ? d.labels : null;
+  if (!list || !list.length) problems.push("labels must list at least one label.");
+  else if (list.length > 5000) problems.push("labels holds more than 5000 entries; split it into batches.");
+  const lines = (list || []).slice(0, 5000).map((l, i) => {
+    const n = i + 1;
+    if (!l || typeof l !== "object") { problems.push(`labels[${n}] is not an object.`); return null; }
+    const sku = str(l.sku, 100);
+    if (!sku) problems.push(`labels[${n}]: sku is required.`);
+    const qty = Number(l.qty);
+    if (!Number.isInteger(qty) || qty < 1) problems.push(`labels[${n}]: qty must be a whole number of 1 or more.`);
+    const cost = Number(l.cost);
+    if (l.cost == null || l.cost === "" || !Number.isFinite(cost) || cost < 0) problems.push(`labels[${n}]: cost must be a number of 0 or more.`);
+    const page = l.page == null || l.page === "" ? null : Number(l.page);
+    if (page !== null && (!Number.isInteger(page) || page < 1)) problems.push(`labels[${n}]: page must be a whole number of 1 or more.`);
+    return { sku, productName: str(l.productName, 255), qty, carrier: str(l.carrier, 60), service: str(l.service, 100),
+      tracking: str(l.tracking, 100), cost: Math.round(cost * 100) / 100, orderId: str(l.orderId, 100), page };
+  });
+  const batch = { batchId, date, platform: str(d.platform, 60), employee: str(d.employee, 100), note: str(d.note, 500) };
+  return { batch, lines: lines.filter(Boolean), problems };
+}
+// Labels in a batch: one per package. Lines with the same tracking number are one package; a line without tracking
+// counts as a package when it carries a cost (the guide puts a package's cost on its first line, 0 on the rest).
+function labelsCount(lines) {
+  const seen = new Set();
+  let n = 0;
+  for (const l of lines) {
+    if (l.tracking) { if (!seen.has(l.tracking)) { seen.add(l.tracking); n++; } }
+    else if (l.cost > 0) n++;
+  }
+  return n;
+}
+async function labelsUpload(request, env) {
+  const want = String(env.LABELS_KEY || "").trim();
+  if (!want) return json({ error: "Label uploads are not switched on." }, 501);
+  const key = String(request.headers.get("X-Labels-Key") || "").trim();
+  if (!key || !safeEqual(key, want)) return json({ error: "Missing or wrong labels key." }, 401);
+  if (!env.TOKEN_KV || !env.LABELS) return json({ error: "Label uploads are not switched on." }, 501);
+  let form;
+  try { form = await request.formData(); } catch { return json({ error: "Send multipart/form-data with a file part and a data part." }, 400); }
+  const file = form.get("file");
+  const raw = form.get("data");
+  const problems = [];
+  if (!file || typeof file === "string") problems.push("file (the labels PDF) is required.");
+  let data = null;
+  if (raw == null) problems.push("data (the JSON text) is required.");
+  else { try { data = JSON.parse(typeof raw === "string" ? raw : await raw.text()); } catch { problems.push("data is not valid JSON."); } }
+  let bytes = null;
+  if (file && typeof file !== "string") {
+    if (file.size > LABELS_MAX_BYTES) problems.push("file is over 25 MB; split it into batches.");
+    else {
+      bytes = await file.arrayBuffer();
+      const head = new TextDecoder().decode(new Uint8Array(bytes.slice(0, 5)));
+      if (head !== "%PDF-") problems.push("file is not a PDF.");
+    }
+  }
+  const checked = data ? labelsCheck(data) : { problems: [] };
+  problems.push(...(checked.problems || []));
+  if (problems.length) return json({ error: problems.join(" "), problems }, 400);
+  const { batch, lines } = checked;
+  batch.labels = labelsCount(lines);
+  batch.units = lines.reduce((s, l) => s + l.qty, 0);
+  batch.totalCost = Math.round(lines.reduce((s, l) => s + l.cost, 0) * 100) / 100;
+  batch.fileSize = bytes.byteLength;
+  batch.uploadedAt = new Date().toISOString();
+  await env.TOKEN_KV.put(labelFileKey(batch.batchId), bytes, { metadata: { size: bytes.byteLength, at: batch.uploadedAt } });
+  const saved = await labelsCall(env, "/put", { batch, lines });
+  return json({ ok: true, batchId: batch.batchId, labels: batch.labels, units: batch.units, totalCost: batch.totalCost, replaced: !!saved.replaced });
+}
+async function labelsRoute(request, env, path, url) {
+  switch (path) {
+    case "/labels/batches": {
+      const { from, to } = labelsRange(url);
+      return json(await labelsCall(env, "/list", { from, to }));
+    }
+    case "/labels/batch": {
+      const batchId = (url.searchParams.get("batchId") || "").trim();
+      if (!batchId) return json({ error: "Add ?batchId=..." }, 400);
+      return json(await labelsCall(env, "/get", { batchId }));
+    }
+    case "/labels/file": {
+      const batchId = (url.searchParams.get("batchId") || "").trim();
+      if (!/^[A-Za-z0-9._-]{1,80}$/.test(batchId)) return json({ error: "Add ?batchId=..." }, 400);
+      if (!env.TOKEN_KV) return json({ error: "Labels aren't switched on yet." }, 501);
+      const { batch } = await labelsCall(env, "/get", { batchId });
+      const pdf = await env.TOKEN_KV.get(labelFileKey(batchId), "arrayBuffer");
+      if (!pdf) return json({ error: "That batch's PDF isn't there." }, 404);
+      return new Response(pdf, { headers: { "content-type": "application/pdf", ...corsHeaders(),
+        "content-disposition": `attachment; filename="labels-${batch.date}-${batchId}.pdf"`, "access-control-expose-headers": "Content-Disposition" } });
+    }
+    case "/labels/downloaded": {
+      let body = {};
+      try { body = (await request.json()) || {}; } catch {}
+      const batchId = String(body.batchId || "").trim();
+      if (!batchId) return json({ error: "batchId is needed." }, 400);
+      await labelsCall(env, "/downloaded", { batchId, by: String(body.by || "").trim().slice(0, 100) || "Someone" });
+      return json({ ok: true });
+    }
+    case "/labels/stats": {
+      const { from, to } = labelsRange(url);
+      const groupBy = (url.searchParams.get("groupBy") || "day").toLowerCase();
+      if (!["day", "week", "month"].includes(groupBy)) return json({ error: "groupBy is day, week or month." }, 400);
+      return json(await labelsCall(env, "/stats", { from, to, groupBy }));
+    }
+  }
+  return json({ error: "Not found." }, 404);
+}
+
+// The labels store: one SQLite Durable Object holding every batch and its lines.
+export class LabelStore {
+  constructor(state) {
+    this.sql = state.storage.sql;
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS batches (batch_id TEXT PRIMARY KEY, date TEXT NOT NULL, platform TEXT, employee TEXT, note TEXT,
+      uploaded_at TEXT, labels INTEGER, units INTEGER, total_cost REAL, file_size INTEGER, downloads TEXT DEFAULT '[]')`);
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS lines (batch_id TEXT NOT NULL, idx INTEGER NOT NULL, sku TEXT, product_name TEXT, qty INTEGER,
+      carrier TEXT, service TEXT, tracking TEXT, cost REAL, order_id TEXT, page INTEGER, PRIMARY KEY (batch_id, idx))`);
+    this.sql.exec("CREATE INDEX IF NOT EXISTS batches_date ON batches(date)");
+  }
+  row(b) {
+    let downloads = [];
+    try { downloads = JSON.parse(b.downloads || "[]"); } catch {}
+    return { batchId: b.batch_id, date: b.date, platform: b.platform || "", employee: b.employee || "", note: b.note || "", uploadedAt: b.uploaded_at,
+      labels: b.labels, units: b.units, totalCost: b.total_cost, fileSize: b.file_size, downloads };
+  }
+  async fetch(request) {
+    const path = new URL(request.url).pathname;
+    const body = await request.json().catch(() => ({}));
+    const out = (x, s = 200) => new Response(JSON.stringify(x), { status: s, headers: { "content-type": "application/json" } });
+    if (path === "/put") {
+      const { batch: b, lines } = body;
+      const had = this.sql.exec("SELECT batch_id FROM batches WHERE batch_id = ?", b.batchId).toArray().length > 0;
+      this.sql.exec("DELETE FROM lines WHERE batch_id = ?", b.batchId);
+      this.sql.exec(`INSERT INTO batches (batch_id, date, platform, employee, note, uploaded_at, labels, units, total_cost, file_size, downloads)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]') ON CONFLICT(batch_id) DO UPDATE SET date = excluded.date, platform = excluded.platform,
+        employee = excluded.employee, note = excluded.note, uploaded_at = excluded.uploaded_at, labels = excluded.labels, units = excluded.units,
+        total_cost = excluded.total_cost, file_size = excluded.file_size`,
+        b.batchId, b.date, b.platform, b.employee, b.note, b.uploadedAt, b.labels, b.units, b.totalCost, b.fileSize);
+      lines.forEach((l, i) => this.sql.exec(`INSERT INTO lines (batch_id, idx, sku, product_name, qty, carrier, service, tracking, cost, order_id, page)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, b.batchId, i, l.sku, l.productName, l.qty, l.carrier, l.service, l.tracking, l.cost, l.orderId, l.page));
+      return out({ ok: true, replaced: had });
+    }
+    if (path === "/list") {
+      const rows = this.sql.exec("SELECT * FROM batches WHERE date >= ? AND date <= ? ORDER BY date DESC, uploaded_at DESC", body.from, body.to).toArray();
+      return out({ batches: rows.map((r) => this.row(r)) });
+    }
+    if (path === "/get") {
+      const b = this.sql.exec("SELECT * FROM batches WHERE batch_id = ?", body.batchId).toArray()[0];
+      if (!b) return out({ error: "No batch with that batchId." }, 404);
+      const lines = this.sql.exec("SELECT * FROM lines WHERE batch_id = ? ORDER BY idx", body.batchId).toArray().map((l) => ({
+        sku: l.sku, productName: l.product_name, qty: l.qty, carrier: l.carrier, service: l.service, tracking: l.tracking, cost: l.cost, orderId: l.order_id, page: l.page }));
+      return out({ batch: { ...this.row(b), lines } });
+    }
+    if (path === "/downloaded") {
+      const b = this.sql.exec("SELECT downloads FROM batches WHERE batch_id = ?", body.batchId).toArray()[0];
+      if (!b) return out({ error: "No batch with that batchId." }, 404);
+      let d = [];
+      try { d = JSON.parse(b.downloads || "[]"); } catch {}
+      d.push({ by: body.by, at: new Date().toISOString() });
+      this.sql.exec("UPDATE batches SET downloads = ? WHERE batch_id = ?", JSON.stringify(d.slice(-200)), body.batchId);
+      return out({ ok: true });
+    }
+    if (path === "/stats") {
+      const { from, to, groupBy } = body;
+      const days = this.sql.exec(`SELECT date, SUM(labels) AS labels, SUM(units) AS units, SUM(total_cost) AS spend, COUNT(*) AS batches
+        FROM batches WHERE date >= ? AND date <= ? GROUP BY date ORDER BY date`, from, to).toArray();
+      const periodOf = (d) => {
+        if (groupBy === "month") return d.slice(0, 7);
+        if (groupBy === "week") { const wd = (new Date(d + "T00:00:00Z").getUTCDay() + 6) % 7; return dayShift(d, -wd); }
+        return d;
+      };
+      const r2 = (x) => Math.round((x || 0) * 100) / 100;
+      const per = new Map();
+      const totals = { spend: 0, labels: 0, units: 0, batches: 0 };
+      for (const d of days) {
+        const k = periodOf(d.date);
+        const p = per.get(k) || { period: k, spend: 0, labels: 0, units: 0 };
+        p.spend += d.spend || 0; p.labels += d.labels || 0; p.units += d.units || 0;
+        per.set(k, p);
+        totals.spend += d.spend || 0; totals.labels += d.labels || 0; totals.units += d.units || 0; totals.batches += d.batches || 0;
+      }
+      const products = this.sql.exec(`SELECT l.sku AS sku, MAX(l.product_name) AS productName, SUM(l.qty) AS units, COUNT(*) AS labels, SUM(l.cost) AS spend
+        FROM lines l JOIN batches b ON b.batch_id = l.batch_id WHERE b.date >= ? AND b.date <= ? GROUP BY l.sku ORDER BY units DESC, sku`, from, to).toArray();
+      totals.spend = r2(totals.spend);
+      return out({ totals, periods: [...per.values()].map((p) => ({ ...p, spend: r2(p.spend) })),
+        products: products.map((p) => ({ sku: p.sku, productName: p.productName || "", units: p.units, labels: p.labels, spend: r2(p.spend) })) });
+    }
+    return out({ error: "Not found." }, 404);
+  }
 }
 
 export default {

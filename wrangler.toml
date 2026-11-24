@@ -22,3 +22,12 @@ class_name = "JobQueue"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["JobQueue"]
+
+# Labels (Nov 24): one SQLite Durable Object keeps the uploaded label batches and their lines for the Hub's dashboard.
+[[durable_objects.bindings]]
+name = "LABELS"
+class_name = "LabelStore"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["LabelStore"]
