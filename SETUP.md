@@ -95,3 +95,8 @@ The worker can assemble kits in Sellercloud with the same call Sellercloud's own
 - **Label downloads (Nov 24).** `/labels/file` answers `Range: bytes=a-b` with 206 for chunked downloads. `POST
   /labels/file-link` `{ batchId }` (Hub key) returns a signed link to `/labels/dl` that works for 15 minutes and carries
   no key; the browser downloads the PDF straight from the worker.
+- **Split runs (Nov 24).** `POST /assemble/job` (and `/assemble/plan`, GET or POST) take `outputs: [{ itemId, final,
+  qty, toBin, fba? }]`, 2 to 6 parts, main card first among them. One break-down into 0.1oz_Bulk_Bin, every final at
+  run's 0.1 units ÷ total produced (rounded down), one assembly per part into its own bin, leftover removed once. Every
+  card of the run is locked to the main card; Clear only from the main card. Every plan answer carries
+  `features: { splitOutputs: true, maxOutputs: 6 }`. Mix kits can't split yet (400).

@@ -67,6 +67,9 @@
 //   time (bin list 10 min, catalog and kit parts 1 min, stock and bin qty 15 s); add &fresh=1 to read Sellercloud now.
 //   POST /assemble {sku,qty,itemId,fromBin,toBin[,source,perKit]}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //   /assemble/kit?sku=SKU          (ASSEMBLE_KEY) a product's kit parts and qty per kit (read-only)
+//   Split runs (Nov 24): POST /assemble/job and /assemble/plan take outputs [{itemId, final, qty, toBin, fba?}] (2 to 6):
+//     one break-down, one assembly per part into its bin at the same units per kit, leftover removed once; every card
+//     of the run is locked to the main card. Every plan answer has features { splitOutputs: true, maxOutputs: 6 }.
 //   Live-board copy (Nov 24): every 5 minutes (cron */5) reads the live Production Schedule (READ ONLY) and copies its
 //     open productions (group Production Schedule, not Done) to the Hub board 18439411777; Text MIRROR_ENABLED = yes turns
 //     it on. GET /mirror/status (ASSEMBLE_KEY or APP_KEY). Writes only to the Hub board, through mirrorMutate.
@@ -1437,6 +1440,7 @@ async function assembleKit(env, body) {
   if (!itemId) throw new HttpError(400, "itemId (the monday item) is needed so a production is only assembled once.");
   const fromBin = await realBin(env, binName(body.fromBin), "From"), toBin = await realBin(env, binName(body.toBin), "To");
   if (!RUN_KV) throw needKv();
+  if (!itemId.includes("#")) await splitGuard(itemId);
   if (await durable.match(doneKey(itemId)))
     throw new HttpError(409, "This production was already sent for assembly. Check Sellercloud before trying again.");
 
@@ -2124,8 +2128,114 @@ async function withRunPer(body) {
   const dis = await durable.match(lockKey("disrec", itemId)).catch(() => null);
   if (dis) { try { const d = JSON.parse(await dis.text()); if (d && d.units > 0) out.runDis = d; } catch {} }
   const hit = await durable.match(lockKey("groups", itemId)).catch(() => null);
-  if (hit) { try { const g = JSON.parse(await hit.text()); if (Array.isArray(g) && g.length === 1 && g[0].perKit > 0) out.runPerKit = g[0].perKit; } catch {} }
+  if (hit) { try { const g = JSON.parse(await hit.text());
+    if (Array.isArray(g) && g.length && g[0].perKit > 0 && (g.length === 1 || (g[0].key && g.every((x) => x.perKit === g[0].perKit)))) out.runPerKit = g[0].perKit; } catch {} }
   return out;
+}
+// ---- Split runs (Nov 24, Shragy: "Build it"): one production run, set amounts reserved for other channels, the rest
+// to the main channel; one Kits card per channel. In Sellercloud: ONE break-down of the bin into the 0.1 bin, then one
+// assembly per output (its final SKU, its qty, its To bin), every final at the same units per kit (run's 0.1 units ÷
+// total produced, rounded down), each final's recipe set to that and checked before its assembly; the leftover is
+// removed once at the end. One run, one set of records under the main card; every card of the run is locked to it.
+// Only through the background run (POST /assemble/job); /assemble/plan shows it.
+const SPLIT_MAX = 6;
+const SPLIT_FEATURES = { splitOutputs: true, maxOutputs: SPLIT_MAX };
+// The run's outputs, checked and in a fixed form, or null when the body has none.
+function splitOutputs(env, body) {
+  let raw = body?.outputs;
+  if (raw == null || raw === "") return null;
+  if (typeof raw === "string") { try { raw = JSON.parse(raw); } catch { throw new HttpError(400, "outputs must be a JSON list."); } }
+  if (!Array.isArray(raw)) throw new HttpError(400, "outputs must be a list of { itemId, final, qty, toBin }.");
+  if (isMix(body)) throw new HttpError(400, "Split runs don't work with mix kits yet. Assemble a mix kit as one card.");
+  if (raw.length < 2 || raw.length > SPLIT_MAX) throw new HttpError(400, `A split run has 2 to ${SPLIT_MAX} parts, not ${raw.length}.`);
+  const main = String(body.itemId || "").trim();
+  if (!main) throw new HttpError(400, "itemId (the main card) is needed.");
+  const fbaBin = String(env.FBA_BIN || "FBA_manual_import").trim();
+  const problems = [], ids = new Set(), finals = new Set(), out = [];
+  raw.forEach((o, i) => {
+    const n = i + 1;
+    if (!o || typeof o !== "object") { problems.push(`Part ${n} isn't an object.`); return; }
+    const itemId = String(o.itemId ?? "").trim(), final = String(o.final ?? "").trim(), toBin = String(o.toBin ?? "").trim();
+    const qty = Number(o.qty), fba = o.fba === true || o.fba === "yes";
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(itemId)) problems.push(`Part ${n}: itemId is needed.`);
+    else if (ids.has(itemId.toLowerCase())) problems.push(`Part ${n}: card ${itemId} is listed twice.`);
+    if (!final) problems.push(`Part ${n}: final (its final SKU) is needed.`);
+    else if (finals.has(final.toLowerCase())) problems.push(`Part ${n}: ${final} is listed twice; each part needs its own final SKU.`);
+    else if (String(body.source || "").trim().toLowerCase() === final.toLowerCase()) problems.push(`Part ${n}: the final can't be the source SKU.`);
+    if (!Number.isInteger(qty) || qty < 1) problems.push(`Part ${n}: qty must be a whole number, 1 or more.`);
+    if (!toBin) problems.push(`Part ${n}: toBin is needed.`);
+    else if (toBin.length > 60 || /[<>&]/.test(toBin)) problems.push(`Part ${n}: that To bin name doesn't look right.`);
+    else if (fba && toBin.toLowerCase() !== fbaBin.toLowerCase()) problems.push(`Part ${n}: FBA parts always assemble into bin ${fbaBin}, not ${toBin}.`);
+    ids.add(itemId.toLowerCase()); finals.add(final.toLowerCase());
+    out.push({ itemId, final, qty, toBin, fba, main: itemId.toLowerCase() === main.toLowerCase(), key: `${main}#o${n}`,
+      ...(o.finalSize ? { finalSize: String(o.finalSize).trim().slice(0, 20) } : {}) });
+  });
+  if (!problems.length && !out.some((o) => o.main)) problems.push(`The main card ${main} must be one of the parts.`);
+  if (problems.length) throw new HttpError(400, problems.join(" "));
+  return out;
+}
+// Which split run a card belongs to (the main card's id), or null. Only non-main cards carry the mark.
+async function splitOf(itemId) {
+  const id = String(itemId || "").trim();
+  if (!id || !RUN_KV) return null;
+  const h = await durable.match(lockKey("splitof", id)).catch(() => null);
+  if (!h) return null;
+  const m = (await h.text()).trim();
+  return m && m.toLowerCase() !== id.toLowerCase() ? m : null;
+}
+async function splitGuard(itemId) {
+  const m = await splitOf(itemId);
+  if (m) throw new HttpError(409, `This card is part of the split run on card ${m}. It assembles with that run, not on its own.`);
+}
+// The plan of a split run (READ-ONLY): the usual plan for the first part at the run's total, plus each other final.
+async function splitPlan(env, body, outs) {
+  const total = outs.reduce((t, o) => t + o.qty, 0);
+  const base = await productionPlan(env, { ...body, final: outs[0].final, produced: total, finalSize: outs[0].finalSize || body.finalSize });
+  const problems = [...base.problems];
+  if (base.mode !== "pre-sized") problems.push("Split runs work for the 0.1 route only, not for a final that's a kit of the pound product itself.");
+  const bridge = base.bridge || null;
+  const per = base.perFinal ?? null;
+  const fk0 = base.steps.find((x) => x.step === "final kit");
+  const asm0 = base.steps.find((x) => x.step === "assemble") || {};
+  const each = asm0.groups && asm0.groups.length === 1 ? asm0.groups[0].perKit : null;
+  const fks = [{ ...fk0, sku: outs[0].final, outKey: outs[0].key }];
+  for (const o of outs.slice(1)) {
+    let fin;
+    try { fin = await kitDefinition(env, o.final, { final: true }); }
+    catch (e) { if (e.busy) throw e; problems.push(e.message || String(e)); fks.push({ step: "final kit", state: "different", current: [], want: null, sku: o.final, outKey: o.key, action: "stop" }); continue; }
+    if (!fin.exists) { problems.push(`${o.final} isn't a product in Sellercloud. Create it there first.`); fks.push({ step: "final kit", state: "different", current: [], want: null, sku: o.final, outKey: o.key, action: "stop" }); continue; }
+    if (fin.sellercloudSaid && !/is not a kit/i.test(fin.sellercloudSaid)) problems.push(`Couldn't read ${o.final}'s kit parts from Sellercloud (${fin.sellercloudSaid}). Try again in a minute.`);
+    const fc = fin.components;
+    const size = sizeTyped(o.finalSize) || sizeFromName(o.final) || sizeFromName(fin.name);
+    const onBridge = !!bridge && fc.length === 1 && fc[0].sku.toLowerCase() === bridge.sku.toLowerCase();
+    const v = size && size.whole ? size.units : onBridge && !size ? fc[0].perKit : null;
+    if (fc.length && !onBridge) problems.push(`${o.final} is already a kit of ${fc.map((c) => `${c.sku} × ${c.perKit}`).join(", ")}, not of the 0.1 product.`);
+    if (v == null) problems.push(`Size not clear for ${o.final}. Enter the size.`);
+    else if (base.perSize != null && v !== base.perSize)
+      problems.push(`${o.final} is ${round3(v / 10)} oz but ${outs[0].final} is ${round3(base.perSize / 10)} oz. Every part of a split run must be the same size.`);
+    const st = bridge ? finalKitStep(fc, bridge.sku, per ?? v, v, "0.1") : { step: "final kit", state: "to set", current: fc, want: null, size };
+    st.action = actionFor(st);
+    fks.push({ ...st, sku: o.final, outKey: o.key });
+  }
+  const asms = outs.map((o, i) => ({ step: "assemble", sku: o.final, qty: o.qty, toBin: o.toBin, itemId: o.itemId, outKey: o.key, part: i + 1,
+    fromBin: asm0.fromBin, perKitRecipe: per, perKitSize: base.perSize, perKitActual: each, uses: each != null ? each * o.qty : null,
+    groups: each != null ? [{ kits: o.qty, perKit: each }] : null, action: "assemble",
+    summary: each != null ? `${o.qty} × ${o.final} at ${each} units of ${bridge?.sku || "0.1"} each, into bin ${o.toBin}.` : null }));
+  const steps = [];
+  for (const st of base.steps) {
+    if (st.step === "final kit") steps.push(...fks);
+    else if (st.step === "assemble") steps.push(...asms);
+    else steps.push(st);
+  }
+  const splitGroups = each != null ? outs.map((o) => ({ kits: o.qty, perKit: each, sku: o.final, toBin: o.toBin, itemId: o.itemId, key: o.key })) : null;
+  return { ...base, split: true, produced: total, final: { sku: outs[0].final, name: base.final?.name ?? null },
+    outputs: outs.map((o, i) => ({ itemId: o.itemId, final: o.final, qty: o.qty, toBin: o.toBin, fba: o.fba, main: o.main, step: asms[i].summary })),
+    splitGroups, steps, problems, ok: problems.length === 0, features: SPLIT_FEATURES };
+}
+// The run's body with its outputs in their checked form, for the job and the produce step.
+function splitBody(body, outs) {
+  const total = outs.reduce((t, o) => t + o.qty, 0);
+  return { ...body, outputs: outs, produced: total, final: outs[0].final, toBin: outs[0].toBin };
 }
 // ---- Mix kits (Shragy, Nov 19): one final kit made from several source products. -------------------------------
 // Same rules as a single kit, per product: each source breaks down into its own 0.1 product in the 0.1 bin; per kit
@@ -2594,7 +2704,7 @@ function callInit(env, ms) {
 // What the Hub reads back for an item (assembleSent, assembleConfirmed, disassembleSent, leftoverRemoved).
 async function itemSentFlags(iid) {
   if (!iid || !RUN_KV) return { assembleSent: null, disassembleSent: null };
-  const asm = [iid, iid + "#g1", iid + "#g2", iid + "#g3"];
+  const asm = [iid, iid + "#g1", iid + "#g2", iid + "#g3", ...Array.from({ length: SPLIT_MAX }, (_, i) => `${iid}#o${i + 1}`)];
   let a = false, conf = null;
   for (const k of asm) {
     const hit = await durable.match(doneKey(k));
@@ -2621,13 +2731,13 @@ function planStepSku(s, plan) {
   switch (s.step) {
     case "0.1 product": return plan.mode === "mix" ? s.sku : src;
     case "empty source": case "put back source": case "source kit": case "disassemble": return s.sku || src;
-    case "final kit": case "assemble": return plan.final?.sku || "";
+    case "final kit": case "assemble": return s.sku || plan.final?.sku || "";
     default: return s.sku || "";
   }
 }
 const jobStepKey = (step, sku) => `${step}|${String(sku || "").toLowerCase()}`;
 function jobLabel(s, plan) {
-  const src = planStepSku(s, plan), fin = plan.final?.sku || "";
+  const src = planStepSku(s, plan), fin = s.sku || plan.final?.sku || "";
   switch (s.step) {
     case "0.1 product": return `Creating 0.1 product ${s.bridgeSku || s.sku}`;
     case "empty source": return `Emptying ${src} to set its kit`;
@@ -2635,7 +2745,7 @@ function jobLabel(s, plan) {
     case "put back source": return `Putting ${src} back`;
     case "final kit": return s.state === "to change" ? `Changing ${fin}'s recipe` : `Setting ${fin}'s recipe`;
     case "disassemble": return `Breaking down ${src}`;
-    case "assemble": return `Assembling ${plan.produced} × ${fin}`;
+    case "assemble": return plan.split ? `Assembling ${s.qty} × ${fin} into bin ${s.toBin}` : `Assembling ${plan.produced} × ${fin}`;
     case "empty leftover": return `Removing leftover ${s.sku || "0.1"}`;
     default: return s.step;
   }
@@ -2648,7 +2758,8 @@ function jobStepsFrom(plan) {
     if (s.step === "empty leftover" && !(s.qty > 0)) continue;
     const keySku = planStepSku(s, plan);
     out.push({ key: jobStepKey(s.step, keySku), keySku, step: s.step, phase: SETUP_STEPS.has(s.step) ? "setup" : "produce",
-      label: jobLabel(s, plan), sku: s.step === "0.1 product" ? (s.bridgeSku || s.sku) : keySku || null, status: "pending" });
+      label: jobLabel(s, plan), sku: s.step === "0.1 product" ? (s.bridgeSku || s.sku) : keySku || null, status: "pending",
+      ...(s.outKey ? { outKey: s.outKey } : {}) });
   }
   // In the order they run: all setup (the final's recipe included) before any break-down.
   return [...out.filter((x) => x.phase === "setup"), ...out.filter((x) => x.phase === "produce")];
@@ -2672,7 +2783,7 @@ async function jobMarkFromRecords(job) {
       const rec = job.mode === "mix" ? await readRec("disrec", mixKey(itemId, st.keySku)) : await readRec("disrec", itemId);
       if (rec) st.status = "done";
     } else if (st.step === "assemble") {
-      const hit = await durable.match(doneKey(itemId));
+      const hit = await durable.match(doneKey(st.outKey || itemId));
       if (hit) { let rec = null; try { rec = JSON.parse(await hit.text()); } catch {} if (rec && rec.confirmed !== false && !rec.recipeUsed) st.status = "done"; }
     }
   }
@@ -2696,7 +2807,19 @@ function jobView(job) {
     needsClear: job.state === "needs-clear", sentFlags: job.sentFlags || null,
     startedAt: new Date(job.createdAt).toISOString(), updatedAt: new Date(job.updatedAt).toISOString(),
     finishedAt: job.finishedAt ? new Date(job.finishedAt).toISOString() : null, startedBy: job.startedBy || null, boardWritten: !!job.ackedAt,
+    ...(job.outputs ? { split: true, outputs: jobOutputs(job) } : {}),
   };
+}
+// Each part of a split run: pending, assembling, assembled or failed (from its assemble step).
+function jobOutputs(job) {
+  const cur = jobCurrent(job);
+  return job.outputs.map((o) => {
+    const i = job.steps.findIndex((s) => s.step === "assemble" && s.outKey === o.key);
+    const st = i >= 0 ? job.steps[i] : null;
+    const state = job.state === "done" || st?.status === "done" ? "assembled" : st?.status === "failed" ? "failed"
+      : i >= 0 && i === cur && job.state === "running" ? "assembling" : "pending";
+    return { itemId: o.itemId, final: o.final, qty: o.qty, toBin: o.toBin, fba: !!o.fba, main: !!o.main, state };
+  });
 }
 function jobStop(job, state, error, extra = {}) {
   const i = jobCurrent(job);
@@ -2717,7 +2840,10 @@ async function jobAdvance(env, job) {
   job.state = "running";
   if (job.phase === "setup") {
     let r;
-    try { r = await setupProduction(env, { ...body, state: job.setupState || {} }); }
+    const outs = job.outputs || null, idx = job.setupIdx || 0;
+    let sb = body;
+    if (outs) { sb = { ...body, final: outs[idx].final, toBin: outs[idx].toBin, produced: job.produced, finalSize: outs[idx].finalSize }; delete sb.outputs; }
+    try { r = await setupProduction(env, { ...sb, state: job.setupState || {} }); }
     catch (e) {
       if (e.busy) return busyWait(e);
       jobStop(job, "failed", e.message || String(e));
@@ -2726,7 +2852,10 @@ async function jobAdvance(env, job) {
     if (r.state) job.setupState = r.state;
     if (r.plan) jobMarkFromPlan(job, r.plan);
     job.detail = r.message || r.error || null;
-    if (r.saved) {
+    if (r.saved && outs && idx < outs.length - 1) {
+      // A split run: the next final's recipe.
+      job.setupIdx = idx + 1; job.pendingTries = 0;
+    } else if (r.saved) {
       for (const s of job.steps) if (s.phase === "setup") s.status = "done";
       job.phase = "produce"; job.pendingTries = 0;
     } else if (r.continue) {
@@ -2754,7 +2883,7 @@ async function jobAdvance(env, job) {
       for (const s of job.steps) s.status = "done";
       job.state = "done"; job.finishedAt = Date.now(); job.detail = r.message;
       job.result = { qty: job.produced, final: job.final, destination: job.toBin, message: r.message,
-        parts: r.parts || (r.assemble?.parts ?? null), removed: r.removed || null };
+        parts: r.parts || (r.assemble?.parts ?? null), removed: r.removed || null, ...(r.outputs ? { outputs: r.outputs } : {}) };
       return 0;
     }
     if (r?.removed) for (const x of r.removed) if (x.ok) { const st = job.steps.find((s) => s.step === "empty leftover" && s.keySku.toLowerCase() === String(x.sku).toLowerCase()); if (st) st.status = "done"; }
@@ -2780,7 +2909,8 @@ async function jobAdvance(env, job) {
   return wait;
 }
 // Kits that can't run side by side: same source product (setup empties all its bins) or same final (its recipe).
-const jobLocks = (job) => [...(job.sources || []).map((x) => "src:" + x.toLowerCase()), "fin:" + String(job.final || "").toLowerCase()];
+const jobLocks = (job) => [...(job.sources || []).map((x) => "src:" + x.toLowerCase()),
+  ...(job.finals && job.finals.length ? job.finals : [job.final]).map((f) => "fin:" + String(f || "").toLowerCase())];
 
 export class JobQueue {
   constructor(state, env) { this.state = state; this.env = env; this.storage = state.storage; }
@@ -2818,16 +2948,24 @@ export class JobQueue {
     switch (url.pathname) {
       case "/add": {
         const itemId = String(body.itemId || "").trim();
-        const prev = await this.latestFor(itemId);
-        if (prev && JOB_ACTIVE.has(prev.state)) return out({ job: jobView(prev), existing: true });
-        if (prev && prev.state === "needs-clear") return out({ error: `This kit stopped part way (${prev.error}). Check Sellercloud, then Clear and allow retry before running it again.`, job: jobView(prev) }, 409);
-        if (prev && prev.state === "done" && !body.again) return out({ error: "This kit was already assembled by a background run.", job: jobView(prev) }, 409);
+        const ids = [...new Set([itemId, ...(Array.isArray(body.itemIds) ? body.itemIds.map((x) => String(x).trim()) : [])].filter(Boolean))];
+        for (const id of ids) {
+          const prev = await this.latestFor(id);
+          const card = id.toLowerCase() === itemId.toLowerCase() ? "" : ` (card ${id})`;
+          if (prev && JOB_ACTIVE.has(prev.state)) {
+            if (String(prev.itemId).toLowerCase() === itemId.toLowerCase()) return out({ job: jobView(prev), existing: true });
+            return out({ error: `Card ${id} is already in another kit run that hasn't finished.`, job: jobView(prev) }, 409);
+          }
+          if (prev && prev.state === "needs-clear") return out({ error: `This kit stopped part way${card} (${prev.error}). Check Sellercloud, then Clear and allow retry before running it again.`, job: jobView(prev) }, 409);
+          if (prev && prev.state === "done" && !body.again) return out({ error: `This kit was already assembled by a background run${card}.`, job: jobView(prev) }, 409);
+        }
         const now = Date.now();
         const job = { id: "j" + now.toString(36) + Math.random().toString(36).slice(2, 7), itemId, body: body.body, mode: body.mode, final: body.final,
           sources: body.sources, fromBin: body.fromBin, toBin: body.toBin, produced: body.produced, startedBy: body.startedBy || null,
-          steps: body.steps, phase: body.steps.some((s) => s.phase === "setup") ? "setup" : "produce", state: "queued", createdAt: now, updatedAt: now, nextAt: now };
+          steps: body.steps, phase: body.steps.some((s) => s.phase === "setup") ? "setup" : "produce", state: "queued", createdAt: now, updatedAt: now, nextAt: now,
+          ...(body.outputs ? { outputs: body.outputs, itemIds: ids, finals: body.finals } : {}) };
         await this.save(job);
-        await this.storage.put(jobItemKey(itemId), job.id);
+        for (const id of ids) await this.storage.put(jobItemKey(id), job.id);
         await this.refreshWaiting(await this.all());
         await this.schedule();
         return out({ job: jobView(await this.storage.get(jobKeyOf(job.id))) });
@@ -2871,7 +3009,10 @@ export class JobQueue {
         // After Clear and allow retry: the item's stopped job goes, so the kit can run again and kits waiting on it go ahead.
         const j = await this.latestFor(body.itemId || "");
         if (j && JOB_ACTIVE.has(j.state)) return out({ error: "This kit is still running in the background.", job: jobView(j) }, 409);
-        if (j) { await this.storage.delete(jobKeyOf(j.id)); await this.storage.delete(jobItemKey(j.itemId)); }
+        if (j) {
+          await this.storage.delete(jobKeyOf(j.id));
+          for (const id of j.itemIds || [j.itemId]) if ((await this.storage.get(jobItemKey(id))) === j.id) await this.storage.delete(jobItemKey(id));
+        }
         await this.refreshWaiting(await this.all());
         await this.schedule();
         return out({ forgot: !!j });
@@ -2904,7 +3045,7 @@ export class JobQueue {
       for (const j of await this.all())
         if (!JOB_ACTIVE.has(j.state) && j.ackedAt && Date.now() - (j.finishedAt || j.updatedAt) > JOB_KEEP_MS) {
           await this.storage.delete(jobKeyOf(j.id));
-          if ((await this.storage.get(jobItemKey(j.itemId))) === j.id) await this.storage.delete(jobItemKey(j.itemId));
+          for (const id of j.itemIds || [j.itemId]) if ((await this.storage.get(jobItemKey(id))) === j.id) await this.storage.delete(jobItemKey(id));
         }
     } finally {
       await tallyCalls(env).catch(() => {});
@@ -2926,6 +3067,9 @@ async function startJob(env, body) {
   if (!env.JOBS) throw new HttpError(501, "Background runs aren't set up on this worker yet (no JOBS Durable Object binding).");
   const itemId = String(body.itemId || "").trim();
   if (!itemId) throw new HttpError(400, "itemId (the monday item) is needed.");
+  const outs = splitOutputs(env, body);
+  if (outs) return startSplitJob(env, body, outs);
+  await splitGuard(itemId);
   const fromBin = String(body.fromBin || "").trim(), toBin = String(body.toBin || "").trim();
   if (!fromBin || !toBin) throw new HttpError(400, "fromBin and toBin are needed.");
   if (body.fba === true || body.fba === "yes") {
@@ -2953,8 +3097,45 @@ async function startJob(env, body) {
   return { job: r.job, existing: !!r.existing };
 }
 
+// A split run in the background queue: every card of the run checked, marked and registered under the one job.
+async function startSplitJob(env, body, outs) {
+  const itemId = String(body.itemId).trim();
+  const fromBin = String(body.fromBin || "").trim();
+  if (!fromBin) throw new HttpError(400, "fromBin is needed.");
+  for (const o of outs) {
+    const a = await jobCall(env, "/active", { itemId: o.itemId });
+    if (a.active) {
+      const runMain = String(a.job?.itemId || "").toLowerCase();
+      if (runMain && outs.some((x) => x.itemId.toLowerCase() === runMain)) return { job: a.job, existing: true };
+      throw Object.assign(new HttpError(409, `Card ${o.itemId} is already in another kit run that hasn't finished.`), { job: a.job });
+    }
+  }
+  for (const o of outs) {
+    const m = await splitOf(o.itemId);
+    if (o.main) { if (m) throw new HttpError(409, `Card ${o.itemId} is part of the split run on card ${m}.`); continue; }
+    if (m && m.toLowerCase() !== itemId.toLowerCase()) throw new HttpError(409, `Card ${o.itemId} is part of the split run on card ${m}.`);
+    if (!m && (await itemStarted(o.itemId))) throw new HttpError(409, `Card ${o.itemId} already has run records of its own. Check Sellercloud and clear that card first.`);
+  }
+  await realBin(env, binName(fromBin), "From");
+  for (const b of new Set(outs.map((o) => o.toBin.toLowerCase()))) await realBin(env, binName(outs.find((o) => o.toBin.toLowerCase() === b).toBin), "To");
+  const clean = splitBody({ ...body }, outs); delete clean.state;
+  const plan = await splitPlan(env, await withRunPer(clean), outs);
+  if (!(await itemStarted(itemId)) && plan.problems.length) throw Object.assign(new HttpError(409, plan.problems.join(" ")), { plan });
+  // Every other card of the run points at the main card from here on, until the main card is cleared.
+  for (const o of outs) if (!o.main) await durable.put(lockKey("splitof", o.itemId), itemId);
+  const r = await jobCall(env, "/add", {
+    itemId, itemIds: outs.map((o) => o.itemId), body: clean, mode: "single", final: outs[0].final, finals: outs.map((o) => o.final),
+    outputs: outs, sources: [String(body.source || "").trim()], fromBin, toBin: outs[0].toBin, produced: plan.produced,
+    startedBy: body.userId || body.startedBy || null, steps: jobStepsFrom(plan),
+  });
+  if (r.status !== 200) throw Object.assign(new HttpError(r.status, r.error || "Couldn't start the run."), { job: r.job });
+  return { job: r.job, existing: !!r.existing };
+}
+
 async function setupProduction(env, body) {
   if (!RUN_KV) throw needKv();
+  if (body?.outputs != null) throw new HttpError(400, "Split runs go through the background run (POST /assemble/job).");
+  await splitGuard(body?.itemId);
   // One setup call at a time per final kit, so two quick presses can't both empty the source.
   const key = String(body.final || body.source || "").trim();
   if (key && (await isLocked("setupcall", key))) return { saved: false, continue: true, message: "Still working on the last step.", state: body.state || {} };
@@ -3212,21 +3393,23 @@ async function confirmAsm(env, key) {
 async function produceProduction(env, body) {
   if (!assembleOn(env)) throw new HttpError(403, "Kit assembly is switched off. It turns on once ASSEMBLE_ENABLED is set to yes.");
   if (!RUN_KV) throw needKv();
+  const outs = body.outputs != null ? splitOutputs(env, body) : null;
   if (isMix(body)) return mixProduce(env, body);
+  if (!outs) await splitGuard(body.itemId);
   if (body.source && (await durable.match(lockKey("zeroed", String(body.source).trim()))))
     return { done: false, status: "failed", message: `${String(body.source).trim()} was emptied for its kit setup and not put back yet. Press Run on the setup again first.` };
   const itemId = String(body.itemId || "").trim();
   if (!itemId) throw new HttpError(400, "itemId (the monday item) is needed so a production only runs once.");
   // Both bins must exist before anything moves (checked again inside the assemble).
-  const fromBin = await realBin(env, binName(body.fromBin), "From"), toBin = await realBin(env, binName(body.toBin), "To");
-  const plan = await productionPlan(env, await withRunPer({ ...body, fromBin }));
+  const fromBin = await realBin(env, binName(body.fromBin), "From"), toBin = await realBin(env, binName(outs ? outs[0].toBin : body.toBin), "To");
+  const plan = outs ? await splitPlan(env, await withRunPer({ ...splitBody(body, outs), fromBin }), outs) : await productionPlan(env, await withRunPer({ ...body, fromBin }));
   // The 0.1 bin (pre-sized only): the break-down goes in, the assembly takes from it.
   const bBin = plan.mode === "pre-sized" ? await realBin(env, plan.bridgeBin, "0.1") : null;
   const notReady = plan.steps.filter((s) => ["create", "set", "stop"].includes(s.action));
   if (notReady.length) {
     const ch = notReady.find((s) => s.step === "final kit" && s.state === "to change");
     throw new HttpError(409, ch && notReady.length === 1
-      ? `${plan.final.sku}'s kit recipe is ${ch.recipeFrom}, not this run's ${ch.recipeTo} per kit, so nothing was assembled. Run the setup again first; it changes the recipe.`
+      ? `${ch.sku || plan.final.sku}'s kit recipe is ${ch.recipeFrom}, not this run's ${ch.recipeTo} per kit, so nothing was assembled. Run the setup again first; it changes the recipe.`
       : "Set up the 0.1 product and kits first.");
   }
   // The kits are assembled in at most two groups (some at N units of 0.1 each, the rest at N + 1, so the whole bin
@@ -3235,11 +3418,16 @@ async function produceProduction(env, body) {
   const gSaved = await durable.match(lockKey("groups", itemId));
   let groups = null;
   if (gSaved) { try { groups = JSON.parse(await gSaved.text()); } catch { groups = null; } }
+  const savedSplit = !!(groups && groups.length && groups[0].key);
+  if (savedSplit && !outs) return { done: false, status: "split run", message: "This production is a split run. It runs from Kits with all its parts." };
+  if (groups && outs && !savedSplit) return { done: false, status: "single run", message: "This production already started as a single run, so it can't be split now. Check Sellercloud, then clear it first." };
+  if (savedSplit && outs && (groups.length !== outs.length || groups.some((g, i) => g.key !== outs[i].key || g.sku.toLowerCase() !== outs[i].final.toLowerCase() || g.kits !== outs[i].qty)))
+    return { done: false, status: "split changed", message: "This split run started with other parts. Check Sellercloud, then clear it from the main card first." };
   const legacyDone = !groups && !!(await durable.match(doneKey(itemId))); // assembled before groups existed
   const asmStep = plan.steps.find((s) => s.step === "assemble");
   const fresh = !groups && !legacyDone;
-  if (fresh) groups = asmStep?.groups || null; // one assembly at bin total ÷ qty produced, either route
-  const gKey = (i) => (groups.length === 1 ? itemId : `${itemId}#g${i + 1}`);
+  if (fresh) groups = outs ? plan.splitGroups : asmStep?.groups || null; // one assembly at bin total ÷ qty produced, either route
+  const gKey = (i) => groups[i].key || (groups.length === 1 ? itemId : `${itemId}#g${i + 1}`);
   let started = legacyDone || !fresh;
   if (groups) for (let i = 0; i < groups.length; i++) {
     const c = await confirmAsm(env, gKey(i));
@@ -3332,15 +3520,19 @@ async function produceProduction(env, body) {
       for (let j = 0; j < 15 && inBin - base < need && !timeUp(); j++) { await sleep(3000); inBin = await binQtyOf(env, part, pBin); }
       if (inBin - base < need)
         return { done: false, continue: true, status: "waiting for parts", message: `Waiting for Sellercloud to show this run's ${part} units in bin ${pBin} (shows ${Math.max(0, inBin - base)} of ${need}).`, disassemble: dis, groups, leftover };
+      const gSku = g.sku || plan.final.sku, gTo = g.toBin ? await realBin(env, binName(g.toBin), "To") : toBin;
       asm = await assembleKit(env, {
-        sku: plan.final.sku, qty: g.kits, itemId: key, fromBin: pBin, toBin, source: part, perKit: plan.perFinal,
+        sku: gSku, qty: g.kits, itemId: key, fromBin: pBin, toBin: gTo, source: part, perKit: plan.perFinal,
         eachPerKit: g.perKit,
       });
       asms.push({ kits: g.kits, perKit: g.perKit, ...asm });
-      if (!asm.done) return { done: false, continue: !!asm.continue, status: asm.status, message: (groups.length > 1 ? `Group ${i + 1} of ${groups.length} (${g.kits} kits × ${g.perKit}): ` : "") + asm.message,
+      if (!asm.done) return { done: false, continue: !!asm.continue, status: asm.status,
+        message: (g.key ? `Part ${i + 1} of ${groups.length} (${g.kits} × ${gSku}): ` : groups.length > 1 ? `Group ${i + 1} of ${groups.length} (${g.kits} kits × ${g.perKit}): ` : "") + asm.message,
         disassemble: dis, assemble: asm, groups, leftover };
       if (i < groups.length - 1)
-        return { done: false, continue: true, status: "assembling", message: `Assembled ${g.kits} × ${plan.final.sku} (${g.perKit} units each). Carrying on with the other ${groups[i + 1].kits}.`,
+        return { done: false, continue: true, status: "assembling", message: g.key
+            ? `Assembled ${g.kits} × ${gSku} into bin ${gTo}. Carrying on with ${groups[i + 1].kits} × ${groups[i + 1].sku}.`
+            : `Assembled ${g.kits} × ${plan.final.sku} (${g.perKit} units each). Carrying on with the other ${groups[i + 1].kits}.`,
           disassemble: dis, assemble: asm, groups, leftover };
     }
   }
@@ -3366,7 +3558,8 @@ async function produceProduction(env, body) {
       await soapCall(env, SOAP_ADJUST,
         `<ProductId>${xmlEsc(bridge)}</ProductId><BinName>${xmlEsc(bBin)}</BinName>` +
         `<WarehouseID>${assembleWarehouse(env)}</WarehouseID><Qty>${-leftover}</Qty>` +
-        `<reason>${xmlEsc(`Production leftover 0.1 after assembling ${plan.produced} x ${plan.final.sku} (monday item ${itemId})`)}</reason>` +
+        `<reason>${xmlEsc(outs ? `Production leftover 0.1 after the split run of ${plan.produced} (${groups.map((g) => `${g.kits} x ${g.sku}`).join(", ")}) (monday item ${itemId})`.slice(0, 480)
+          : `Production leftover 0.1 after assembling ${plan.produced} x ${plan.final.sku} (monday item ${itemId})`)}</reason>` +
         `<SerialsList></SerialsList>${await expiryXml(env, SOAP_ADJUST)}<LotNumber></LotNumber>`);
     } catch (e) { err = e.message || String(e); }
     let after = await binNow();
@@ -3380,13 +3573,16 @@ async function produceProduction(env, body) {
       assemble: asm, emptyLeftover: empty, leftover };
   }
   const total = groups ? groups.reduce((t, g) => t + g.kits * g.perKit, 0) : null;
-  const msg = groups && groups.length > 1 && plan.mode === "pre-sized"
+  const msg = outs && groups
+    ? `Assembled ${groups.map((g) => `${g.kits} × ${g.sku} into bin ${g.toBin}`).join(", ")} in Skustack, ${groups[0].perKit} units of ${plan.bridge.sku} each from bin ${bBin} (${total} in all).`
+    : groups && groups.length > 1 && plan.mode === "pre-sized"
     ? `Assembled ${plan.produced} × ${plan.final.sku} in Skustack, from bin ${bBin || fromBin} to bin ${toBin}: ${groups.map((g) => `${g.kits} with ${g.perKit}`).join(" and ")} units of ${plan.bridge.sku} (${total} in all).`
     : asm?.message || `${plan.final.sku} was already assembled.`;
   const stays = plan.steps.find((s) => s.step === "assemble" && s.leftoverStays)?.leftover || 0;
   return { done: true, status: "assembled", message: msg + (empty ? ` Removed this run's ${leftover} leftover ${plan.bridge.sku} from bin ${bBin}.` : "") +
       (stays ? ` ${stays}${plan.mode === "pre-sized" ? ` ${plan.bridge.sku}` : ` lb of ${plan.source.sku}`} stay in bin ${fromBin}.` : ""),
-    disassemble: dis, disassembledEarlier: !dis && plan.mode === "pre-sized" && !(plan.binQty > 0), assemble: asm, assembles: asms, groups, emptyLeftover: empty, leftover, leftInBin: stays };
+    disassemble: dis, disassembledEarlier: !dis && plan.mode === "pre-sized" && !(plan.binQty > 0), assemble: asm, assembles: asms, groups, emptyLeftover: empty, leftover, leftInBin: stays,
+    ...(outs && groups ? { outputs: groups.map((g) => ({ itemId: g.itemId, final: g.sku, qty: g.kits, toBin: g.toBin, perKit: g.perKit, state: "assembled" })) } : {}) };
 }
 
 // Lists the SOAP service's operations (from its own WSDL) whose name matches q, with their inputs.
@@ -3455,7 +3651,7 @@ async function handle(request, env) {
   const isAssemble = p0 === "/assemble";
   const isPost = isAssemble || p0 === "/assemble/setup" || p0 === "/assemble/produce" || p0 === "/assemble/refresh" || p0 === "/assemble/clear"
     || p0 === "/assemble/job/cancel" || p0 === "/assemble/job/ack" || p0 === "/assemble/create-product";
-  const okMethod = p0 === "/assemble/job" ? ["GET", "POST"].includes(request.method) : isPost ? request.method === "POST" : request.method === "GET";
+  const okMethod = p0 === "/assemble/job" || p0 === "/assemble/plan" ? ["GET", "POST"].includes(request.method) : isPost ? request.method === "POST" : request.method === "GET";
   if (!okMethod)
     return json({ error: isPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
 
@@ -3699,19 +3895,32 @@ async function handle(request, env) {
     }
 
     case "/assemble/plan": {
-      const g = (k) => (url.searchParams.get(k) || "").trim();
-      const srcs = url.searchParams.getAll("sources");
+      let pb = null;
+      if (request.method === "POST") { try { pb = (await request.json()) || {}; } catch { return json({ error: "Send the details as JSON." }, 400); } }
+      const g = (k) => pb ? String(pb[k] ?? "").trim() : (url.searchParams.get(k) || "").trim();
+      const outsRaw = pb ? pb.outputs : url.searchParams.get("outputs");
+      if (outsRaw != null && outsRaw !== "") {
+        const q = { source: g("source"), fromBin: g("fromBin"), itemId: g("itemId"), sourceSize: g("sourceSize"), finalSize: g("finalSize"), outputs: outsRaw,
+          sources: pb ? pb.sources : url.searchParams.getAll("sources") };
+        const outs = splitOutputs(env, q);
+        const plan = await splitPlan(env, await withRunPer(splitBody(q, outs)), outs);
+        plan.savedStepsWork = await cacheWorks();
+        return json(plan);
+      }
+      const srcs = pb ? listParam(pb.sources) : url.searchParams.getAll("sources");
       const mixQ = { sources: srcs.length > 1 ? srcs : srcs[0] || "", types: g("types"), maxDiffPct: g("maxDiffPct") };
       if (isMix(mixQ)) {
         const plan = await mixPlan(env, await withMixRun({ ...mixQ, final: g("final"), fromBin: g("fromBin"), produced: g("produced"),
           finalSize: g("finalSize"), itemId: g("itemId") }));
         plan.savedStepsWork = await cacheWorks();
+        plan.features = SPLIT_FEATURES;
         return json(plan);
       }
       const plan = await productionPlan(env, await withRunPer({ source: g("source"), final: g("final"), fromBin: g("fromBin"), produced: g("produced"),
         finalSize: g("finalSize"), sourceSize: g("sourceSize"), itemId: g("itemId") }));
       // Whether the worker can remember finished steps here (the double-run guards rely on it).
       plan.savedStepsWork = await cacheWorks();
+      plan.features = SPLIT_FEATURES;
       return json(plan);
     }
 
@@ -3723,12 +3932,20 @@ async function handle(request, env) {
       const itemId = String(body.itemId || "").trim();
       if (!itemId) return json({ error: "itemId is needed." }, 400);
       if (!RUN_KV) throw needKv();
+      const partOf = await splitOf(itemId);
+      if (partOf) return json({ error: `This card is part of the split run on card ${partOf}. Clear that card; it clears the whole run.` }, 409);
       if (env.JOBS) {
         const a = await jobCall(env, "/active", { itemId });
         if (a.active) return json({ error: "This kit is still running in the background. Wait until it finishes or stops.", job: a.job }, 409);
       }
       const keys = [doneKey(itemId), doneKey(itemId + "#g1"), doneKey(itemId + "#g2"), doneKey(itemId + "#g3"),
+        ...Array.from({ length: SPLIT_MAX }, (_, i) => doneKey(`${itemId}#o${i + 1}`)),
         ...["groups", "disassembled", "disrec", "emptied", "leftover", "mixrun"].map((k) => lockKey(k, itemId))];
+      // A split run: the other cards' marks go too (from the saved parts, and the running job's cards).
+      const gr = await readRec("groups", itemId);
+      const partIds = new Set((Array.isArray(gr) ? gr : []).filter((x) => x && x.key && x.itemId).map((x) => String(x.itemId)));
+      if (env.JOBS) { const lj = await jobCall(env, "/get", { itemIds: [itemId] }).catch(() => null); for (const o of lj?.jobs?.[0]?.outputs || []) partIds.add(String(o.itemId)); }
+      for (const id of partIds) if (id.toLowerCase() !== itemId.toLowerCase()) keys.push(lockKey("splitof", id));
       // A mix run's records per source and per 0.1 product.
       const mr = await readRec("mixrun", itemId);
       for (const x of mr?.sources || []) keys.push(lockKey("disrec", mixKey(itemId, x.sku)), lockKey("disassembled", mixKey(itemId, x.sku)), lockKey("brbase", mixKey(itemId, "base:" + x.bridge)));
@@ -3774,6 +3991,7 @@ async function handle(request, env) {
     case "/assemble/produce": {
       let body;
       try { body = await request.json(); } catch { return json({ error: "Send the details as JSON." }, 400); }
+      if (body?.outputs != null) return json({ error: "Split runs go through the background run (POST /assemble/job)." }, 400);
       if (p0 === "/assemble/setup") { const r = await setupProduction(env, body || {}); return json(r, r.saved || r.pending || r.continue ? 200 : 409); }
       // assembleSent / disassembleSent (for the Hub, Nov 19): true once that item's assembly or break-down has been
       // sent to Sellercloud, confirmed or not. The Hub stops calling by itself once assembleSent is true and not done.
