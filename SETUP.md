@@ -88,3 +88,7 @@ The worker can assemble kits in Sellercloud with the same call Sellercloud's own
   18439411777, tagged in "Live board item". Turn on with Text variable `MIRROR_ENABLED` = `yes`; anything else = off.
   Optional: `MIRROR_SKIP` (comma list of live ids, default 13598232255), `MIRROR_MAX_CALLS` (writes per run, default 350).
   Check it at `GET /mirror/status?key=` (Hub key). Nothing is ever written to the live board.
+- **Label carriers (Nov 24).** Upload `data` takes a batch-level `carrier` (GOFO, UPS, USPS, FedEx, DHL, OnTrac, Amazon
+  Shipping, Veho, LaserShip, or any other name). Batches show `carrier` (or Mixed / Unknown) and a `carriers` breakdown;
+  `?carrier=` filters /labels/batches and /labels/stats; /labels/stats adds spend per carrier. Old batches get theirs from
+  their lines.

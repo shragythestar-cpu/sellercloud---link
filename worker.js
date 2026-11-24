@@ -70,7 +70,9 @@
 //   Live-board copy (Nov 24): every 5 minutes (cron */5) reads the live Production Schedule (READ ONLY) and copies its
 //     open productions (group Production Schedule, not Done) to the Hub board 18439411777; Text MIRROR_ENABLED = yes turns
 //     it on. GET /mirror/status (ASSEMBLE_KEY or APP_KEY). Writes only to the Hub board, through mirrorMutate.
-//   Labels (Nov 24; nothing calls Sellercloud): POST /labels/upload (multipart file + data JSON; header X-Labels-Key =
+//   Labels (Nov 24; nothing calls Sellercloud). Carrier (Nov 24): upload data takes a batch-level `carrier`; batches and
+//     /labels/batch show `carrier` and `carriers` (worked out from the lines for older batches); /labels/batches and
+//     /labels/stats take ?carrier=; /labels/stats adds `carriers`.: POST /labels/upload (multipart file + data JSON; header X-Labels-Key =
 //     Secret LABELS_KEY, 501 until it's set); GET /labels/batches?from=&to=, /labels/batch?batchId=, /labels/file?batchId=,
 //     /labels/stats?from=&to=&groupBy=day|week|month, POST /labels/downloaded {batchId,by} (ASSEMBLE_KEY or APP_KEY).
 //     PDFs in KV (TOKEN_KV, labels:file:<batchId>); batches and lines in the SQLite Durable Object LabelStore (binding LABELS).
@@ -4177,8 +4179,46 @@ function labelsCheck(d) {
     return { sku, productName: str(l.productName, 255), qty, carrier: str(l.carrier, 60), service: str(l.service, 100),
       tracking: str(l.tracking, 100), cost: Math.round(cost * 100) / 100, orderId: str(l.orderId, 100), page };
   });
-  const batch = { batchId, date, platform: str(d.platform, 60), employee: str(d.employee, 100), note: str(d.note, 500) };
+  const batch = { batchId, date, platform: str(d.platform, 60), employee: str(d.employee, 100), note: str(d.note, 500), carrier: str(d.carrier, 60) };
   return { batch, lines: lines.filter(Boolean), problems };
+}
+// Carriers (Nov 24, Shragy: "it should always have carrier labels"). Names are matched case-insensitively to the
+// known ones; anything else is kept as sent (trimmed); empty = "Unknown".
+const CARRIERS = ["GOFO", "UPS", "USPS", "FedEx", "DHL", "OnTrac", "Amazon Shipping", "Veho", "LaserShip"];
+const CARRIER_KEY = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const CARRIER_BY_KEY = new Map(CARRIERS.map((c) => [CARRIER_KEY(c), c]));
+function normCarrier(v) {
+  const t = String(v == null ? "" : v).trim();
+  if (!t) return "";
+  return CARRIER_BY_KEY.get(CARRIER_KEY(t)) || t;
+}
+// Batch carrier and per-carrier breakdown, from the batch-level carrier (if sent) and the lines' carriers.
+// A package (same tracking, or a no-tracking line with a cost) takes its first line's carrier.
+function carrierInfo(batchCarrier, lines) {
+  const own = normCarrier(batchCarrier);
+  const seen = [...new Set(lines.map((l) => normCarrier(l.carrier)).filter(Boolean))];
+  const carrier = own || (seen.length === 1 ? seen[0] : seen.length > 1 ? "Mixed" : "Unknown");
+  const fallback = carrier === "Mixed" ? "Unknown" : carrier;
+  const per = new Map();
+  const get = (c) => per.get(c) || (per.set(c, { carrier: c, labels: 0, units: 0, cost: 0 }), per.get(c));
+  const pkg = new Map();
+  const eff = [];
+  for (const l of lines) {
+    let c = normCarrier(l.carrier) || fallback;
+    if (l.tracking) { if (pkg.has(l.tracking)) c = pkg.get(l.tracking); else { pkg.set(l.tracking, c); get(c).labels++; } }
+    else if (l.cost > 0) get(c).labels++;
+    const g = get(c);
+    g.units += l.qty || 0; g.cost += l.cost || 0;
+    eff.push(c);
+  }
+  const carriers = [...per.values()].map((x) => ({ ...x, cost: Math.round(x.cost * 100) / 100 })).sort((a, b) => b.cost - a.cost || b.labels - a.labels);
+  return { carrier, carriers, lineCarriers: eff };
+}
+function labelsCarrierParam(url) {
+  const raw = url.searchParams.get("carrier");
+  if (raw == null || !raw.trim()) return "";
+  const k = CARRIER_KEY(raw);
+  return k === "unknown" ? "Unknown" : k === "mixed" ? "Mixed" : normCarrier(raw);
 }
 // Labels in a batch: one per package. Lines with the same tracking number are one package; a line without tracking
 // counts as a package when it carries a cost (the guide puts a package's cost on its first line, 0 on the rest).
@@ -4226,13 +4266,13 @@ async function labelsUpload(request, env) {
   batch.uploadedAt = new Date().toISOString();
   await env.TOKEN_KV.put(labelFileKey(batch.batchId), bytes, { metadata: { size: bytes.byteLength, at: batch.uploadedAt } });
   const saved = await labelsCall(env, "/put", { batch, lines });
-  return json({ ok: true, batchId: batch.batchId, labels: batch.labels, units: batch.units, totalCost: batch.totalCost, replaced: !!saved.replaced });
+  return json({ ok: true, batchId: batch.batchId, carrier: carrierInfo(batch.carrier, lines).carrier, labels: batch.labels, units: batch.units, totalCost: batch.totalCost, replaced: !!saved.replaced });
 }
 async function labelsRoute(request, env, path, url) {
   switch (path) {
     case "/labels/batches": {
       const { from, to } = labelsRange(url);
-      return json(await labelsCall(env, "/list", { from, to }));
+      return json(await labelsCall(env, "/list", { from, to, carrier: labelsCarrierParam(url) }));
     }
     case "/labels/batch": {
       const batchId = (url.searchParams.get("batchId") || "").trim();
@@ -4261,7 +4301,7 @@ async function labelsRoute(request, env, path, url) {
       const { from, to } = labelsRange(url);
       const groupBy = (url.searchParams.get("groupBy") || "day").toLowerCase();
       if (!["day", "week", "month"].includes(groupBy)) return json({ error: "groupBy is day, week or month." }, 400);
-      return json(await labelsCall(env, "/stats", { from, to, groupBy }));
+      return json(await labelsCall(env, "/stats", { from, to, groupBy, carrier: labelsCarrierParam(url) }));
     }
   }
   return json({ error: "Not found." }, 404);
@@ -4276,6 +4316,24 @@ export class LabelStore {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS lines (batch_id TEXT NOT NULL, idx INTEGER NOT NULL, sku TEXT, product_name TEXT, qty INTEGER,
       carrier TEXT, service TEXT, tracking TEXT, cost REAL, order_id TEXT, page INTEGER, PRIMARY KEY (batch_id, idx))`);
     this.sql.exec("CREATE INDEX IF NOT EXISTS batches_date ON batches(date)");
+    const cols = this.sql.exec("PRAGMA table_info(batches)").toArray().map((c) => c.name);
+    if (!cols.includes("carrier")) this.sql.exec("ALTER TABLE batches ADD COLUMN carrier TEXT DEFAULT ''");
+  }
+  lineRow(l) {
+    return { sku: l.sku, productName: l.product_name, qty: l.qty, carrier: l.carrier, service: l.service, tracking: l.tracking, cost: l.cost, orderId: l.order_id, page: l.page };
+  }
+  linesFor(ids) {
+    const by = new Map(ids.map((id) => [id, []]));
+    for (let i = 0; i < ids.length; i += 50) {
+      const part = ids.slice(i, i + 50);
+      const rows = this.sql.exec(`SELECT * FROM lines WHERE batch_id IN (${part.map(() => "?").join(",")}) ORDER BY batch_id, idx`, ...part).toArray();
+      for (const l of rows) by.get(l.batch_id).push(this.lineRow(l));
+    }
+    return by;
+  }
+  withCarrier(b, lines) {
+    const { carrier, carriers } = carrierInfo(b.carrier, lines);
+    return { ...this.row(b), carrier, carriers };
   }
   row(b) {
     let downloads = [];
@@ -4296,20 +4354,23 @@ export class LabelStore {
         employee = excluded.employee, note = excluded.note, uploaded_at = excluded.uploaded_at, labels = excluded.labels, units = excluded.units,
         total_cost = excluded.total_cost, file_size = excluded.file_size`,
         b.batchId, b.date, b.platform, b.employee, b.note, b.uploadedAt, b.labels, b.units, b.totalCost, b.fileSize);
+      this.sql.exec("UPDATE batches SET carrier = ? WHERE batch_id = ?", b.carrier || "", b.batchId);
       lines.forEach((l, i) => this.sql.exec(`INSERT INTO lines (batch_id, idx, sku, product_name, qty, carrier, service, tracking, cost, order_id, page)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, b.batchId, i, l.sku, l.productName, l.qty, l.carrier, l.service, l.tracking, l.cost, l.orderId, l.page));
       return out({ ok: true, replaced: had });
     }
     if (path === "/list") {
       const rows = this.sql.exec("SELECT * FROM batches WHERE date >= ? AND date <= ? ORDER BY date DESC, uploaded_at DESC", body.from, body.to).toArray();
-      return out({ batches: rows.map((r) => this.row(r)) });
+      const lines = this.linesFor(rows.map((r) => r.batch_id));
+      let batches = rows.map((r) => this.withCarrier(r, lines.get(r.batch_id)));
+      if (body.carrier) batches = batches.filter((b) => b.carrier === body.carrier || b.carriers.some((c) => c.carrier === body.carrier));
+      return out({ batches });
     }
     if (path === "/get") {
       const b = this.sql.exec("SELECT * FROM batches WHERE batch_id = ?", body.batchId).toArray()[0];
       if (!b) return out({ error: "No batch with that batchId." }, 404);
-      const lines = this.sql.exec("SELECT * FROM lines WHERE batch_id = ? ORDER BY idx", body.batchId).toArray().map((l) => ({
-        sku: l.sku, productName: l.product_name, qty: l.qty, carrier: l.carrier, service: l.service, tracking: l.tracking, cost: l.cost, orderId: l.order_id, page: l.page }));
-      return out({ batch: { ...this.row(b), lines } });
+      const lines = this.sql.exec("SELECT * FROM lines WHERE batch_id = ? ORDER BY idx", body.batchId).toArray().map((l) => this.lineRow(l));
+      return out({ batch: { ...this.withCarrier(b, lines), lines } });
     }
     if (path === "/downloaded") {
       const b = this.sql.exec("SELECT downloads FROM batches WHERE batch_id = ?", body.batchId).toArray()[0];
@@ -4321,7 +4382,7 @@ export class LabelStore {
       return out({ ok: true });
     }
     if (path === "/stats") {
-      const { from, to, groupBy } = body;
+      const { from, to, groupBy, carrier: only } = body;
       const days = this.sql.exec(`SELECT date, SUM(labels) AS labels, SUM(units) AS units, SUM(total_cost) AS spend, COUNT(*) AS batches
         FROM batches WHERE date >= ? AND date <= ? GROUP BY date ORDER BY date`, from, to).toArray();
       const periodOf = (d) => {
@@ -4339,11 +4400,45 @@ export class LabelStore {
         per.set(k, p);
         totals.spend += d.spend || 0; totals.labels += d.labels || 0; totals.units += d.units || 0; totals.batches += d.batches || 0;
       }
-      const products = this.sql.exec(`SELECT l.sku AS sku, MAX(l.product_name) AS productName, SUM(l.qty) AS units, COUNT(*) AS labels, SUM(l.cost) AS spend
+      let products = this.sql.exec(`SELECT l.sku AS sku, MAX(l.product_name) AS productName, SUM(l.qty) AS units, COUNT(*) AS labels, SUM(l.cost) AS spend
         FROM lines l JOIN batches b ON b.batch_id = l.batch_id WHERE b.date >= ? AND b.date <= ? GROUP BY l.sku ORDER BY units DESC, sku`, from, to).toArray();
+      // Per carrier, from each batch's lines (old batches included).
+      const brows = this.sql.exec("SELECT * FROM batches WHERE date >= ? AND date <= ?", from, to).toArray();
+      const blines = this.linesFor(brows.map((b) => b.batch_id));
+      const cs = new Map();
+      const fil = { per: new Map(), totals: { spend: 0, labels: 0, units: 0, batches: 0 }, products: new Map() };
+      for (const b of brows) {
+        const ls = blines.get(b.batch_id);
+        const info = carrierInfo(b.carrier, ls);
+        for (const c of info.carriers) {
+          const t = cs.get(c.carrier) || { carrier: c.carrier, spend: 0, labels: 0, units: 0, batches: 0 };
+          t.spend += c.cost; t.labels += c.labels; t.units += c.units; t.batches++;
+          cs.set(c.carrier, t);
+        }
+        if (!only) continue;
+        const mine = info.carriers.find((c) => c.carrier === only);
+        if (!mine) continue;
+        const k = periodOf(b.date);
+        const p = fil.per.get(k) || { period: k, spend: 0, labels: 0, units: 0 };
+        p.spend += mine.cost; p.labels += mine.labels; p.units += mine.units; fil.per.set(k, p);
+        fil.totals.spend += mine.cost; fil.totals.labels += mine.labels; fil.totals.units += mine.units; fil.totals.batches++;
+        ls.forEach((l, i) => {
+          if (info.lineCarriers[i] !== only) return;
+          const q = fil.products.get(l.sku) || { sku: l.sku, productName: "", units: 0, labels: 0, spend: 0 };
+          if (l.productName && l.productName > q.productName) q.productName = l.productName;
+          q.units += l.qty || 0; q.labels++; q.spend += l.cost || 0; fil.products.set(l.sku, q);
+        });
+      }
+      const carriers = [...cs.values()].map((c) => ({ ...c, spend: r2(c.spend) })).sort((a, b) => b.spend - a.spend || b.labels - a.labels);
+      if (only) {
+        totals.spend = fil.totals.spend; totals.labels = fil.totals.labels; totals.units = fil.totals.units; totals.batches = fil.totals.batches;
+        per.clear(); for (const [k, v] of [...fil.per.entries()].sort()) per.set(k, v);
+        products = [...fil.products.values()].sort((a, b) => b.units - a.units || (a.sku < b.sku ? -1 : 1));
+      }
       totals.spend = r2(totals.spend);
       return out({ totals, periods: [...per.values()].map((p) => ({ ...p, spend: r2(p.spend) })),
-        products: products.map((p) => ({ sku: p.sku, productName: p.productName || "", units: p.units, labels: p.labels, spend: r2(p.spend) })) });
+        products: products.map((p) => ({ sku: p.sku, productName: p.productName || "", units: p.units, labels: p.labels, spend: r2(p.spend) })),
+        carriers, ...(only ? { carrier: only } : {}) });
     }
     return out({ error: "Not found." }, 404);
   }
