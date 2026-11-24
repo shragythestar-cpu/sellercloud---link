@@ -72,7 +72,9 @@
 //     it on. GET /mirror/status (ASSEMBLE_KEY or APP_KEY). Writes only to the Hub board, through mirrorMutate.
 //   Labels (Nov 24; nothing calls Sellercloud). Carrier (Nov 24): upload data takes a batch-level `carrier`; batches and
 //     /labels/batch show `carrier` and `carriers` (worked out from the lines for older batches); /labels/batches and
-//     /labels/stats take ?carrier=; /labels/stats adds `carriers`.: POST /labels/upload (multipart file + data JSON; header X-Labels-Key =
+//     /labels/stats take ?carrier=; /labels/stats adds `carriers`.
+//   Label downloads (Nov 24): /labels/file honours Range: bytes=a-b (206). POST /labels/file-link {batchId} (Hub key) gives a
+//     15-minute signed link to GET /labels/dl (no key in it), which streams the PDF straight to the browser.: POST /labels/upload (multipart file + data JSON; header X-Labels-Key =
 //     Secret LABELS_KEY, 501 until it's set); GET /labels/batches?from=&to=, /labels/batch?batchId=, /labels/file?batchId=,
 //     /labels/stats?from=&to=&groupBy=day|week|month, POST /labels/downloaded {batchId,by} (ASSEMBLE_KEY or APP_KEY).
 //     PDFs in KV (TOKEN_KV, labels:file:<batchId>); batches and lines in the SQLite Durable Object LabelStore (binding LABELS).
@@ -3438,8 +3440,12 @@ async function handle(request, env) {
     if (!ok) return json({ error: "Missing or wrong key." }, 401);
     return json(await mirrorStatus(env));
   }
+  if (p0 === "/labels/dl") {
+    if (request.method !== "GET" && request.method !== "HEAD") return new Response("Only GET is allowed here.", { status: 405 });
+    return labelsDirect(request, env, url);
+  }
   if (p0.startsWith("/labels/")) {
-    const wantPost = p0 === "/labels/downloaded";
+    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link";
     if (request.method !== (wantPost ? "POST" : "GET")) return json({ error: wantPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
     const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
     const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
@@ -4268,6 +4274,52 @@ async function labelsUpload(request, env) {
   const saved = await labelsCall(env, "/put", { batch, lines });
   return json({ ok: true, batchId: batch.batchId, carrier: carrierInfo(batch.carrier, lines).carrier, labels: batch.labels, units: batch.units, totalCost: batch.totalCost, replaced: !!saved.replaced });
 }
+// PDF downloads. /labels/file (Hub key) honours Range: bytes=a-b for chunked downloads; /labels/dl serves a signed,
+// 15-minute link (POST /labels/file-link) so the browser downloads straight from the worker, with no key in the link.
+const labelsFilename = (batch) => `labels-${batch.date}-${batch.batchId}.pdf`;
+const labelsLinkSecret = (env) => String(env.ASSEMBLE_KEY || env.APP_KEY || "").trim();
+async function labelsSign(secret, batchId, exp) {
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode("labels-dl:" + secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(`${batchId}|${exp}`));
+  return [...new Uint8Array(mac)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function labelsPdf(env, request, batchId, filename, cors) {
+  const base = { "content-type": "application/pdf", "content-disposition": `attachment; filename="${filename}"`, "accept-ranges": "bytes",
+    "cache-control": "private, no-store", ...(cors ? { ...corsHeaders(), "access-control-expose-headers": "Content-Disposition, Content-Range, Content-Length, Accept-Ranges" } : {}) };
+  const range = (request.headers.get("Range") || "").trim();
+  const m = range.match(/^bytes=(\d*)-(\d*)$/);
+  if (m && (m[1] || m[2])) {
+    const buf = await env.TOKEN_KV.get(labelFileKey(batchId), "arrayBuffer");
+    if (!buf) return null;
+    const total = buf.byteLength;
+    let a, b;
+    if (m[1]) { a = Number(m[1]); b = m[2] ? Math.min(Number(m[2]), total - 1) : total - 1; }
+    else { a = Math.max(0, total - Number(m[2])); b = total - 1; }
+    if (a >= total || a > b) return new Response(null, { status: 416, headers: { ...base, "content-range": `bytes */${total}` } });
+    const part = buf.slice(a, b + 1);
+    return new Response(request.method === "HEAD" ? null : part, { status: 206, headers: { ...base, "content-range": `bytes ${a}-${b}/${total}`, "content-length": String(part.byteLength) } });
+  }
+  const got = await env.TOKEN_KV.getWithMetadata(labelFileKey(batchId), "stream");
+  if (!got || !got.value) return null;
+  const size = got.metadata && got.metadata.size;
+  const headers = { ...base, ...(size ? { "content-length": String(size) } : {}) };
+  if (request.method === "HEAD") { try { await got.value.cancel(); } catch {} return new Response(null, { headers }); }
+  return new Response(got.value, { headers });
+}
+async function labelsDirect(request, env, url) {
+  const gone = () => new Response("This download link has expired. Open it again from the Hub.", { status: 403, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+  const batchId = (url.searchParams.get("batchId") || "").trim();
+  const exp = (url.searchParams.get("exp") || "").trim();
+  const sig = (url.searchParams.get("sig") || "").trim().toLowerCase();
+  const secret = labelsLinkSecret(env);
+  if (!secret || !env.TOKEN_KV || !/^[A-Za-z0-9._-]{1,80}$/.test(batchId) || !/^\d{1,12}$/.test(exp) || !/^[0-9a-f]{64}$/.test(sig)) return gone();
+  if (Number(exp) < Math.floor(Date.now() / 1000)) return gone();
+  if (!safeEqual(sig, await labelsSign(secret, batchId, Number(exp)))) return gone();
+  let batch;
+  try { ({ batch } = await labelsCall(env, "/get", { batchId })); } catch { return new Response("That batch isn't there any more.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } }); }
+  const res = await labelsPdf(env, request, batchId, labelsFilename(batch), false);
+  return res || new Response("That batch's PDF isn't there.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } });
+}
 async function labelsRoute(request, env, path, url) {
   switch (path) {
     case "/labels/batches": {
@@ -4284,10 +4336,22 @@ async function labelsRoute(request, env, path, url) {
       if (!/^[A-Za-z0-9._-]{1,80}$/.test(batchId)) return json({ error: "Add ?batchId=..." }, 400);
       if (!env.TOKEN_KV) return json({ error: "Labels aren't switched on yet." }, 501);
       const { batch } = await labelsCall(env, "/get", { batchId });
-      const pdf = await env.TOKEN_KV.get(labelFileKey(batchId), "arrayBuffer");
-      if (!pdf) return json({ error: "That batch's PDF isn't there." }, 404);
-      return new Response(pdf, { headers: { "content-type": "application/pdf", ...corsHeaders(),
-        "content-disposition": `attachment; filename="labels-${batch.date}-${batchId}.pdf"`, "access-control-expose-headers": "Content-Disposition" } });
+      const res = await labelsPdf(env, request, batchId, labelsFilename(batch), true);
+      return res || json({ error: "That batch's PDF isn't there." }, 404);
+    }
+    case "/labels/file-link": {
+      let body = {};
+      try { body = (await request.json()) || {}; } catch {}
+      const batchId = String(body.batchId || "").trim();
+      if (!/^[A-Za-z0-9._-]{1,80}$/.test(batchId)) return json({ error: "batchId is needed." }, 400);
+      const secret = labelsLinkSecret(env);
+      if (!secret) return json({ error: "Download links aren't switched on." }, 501);
+      const { batch } = await labelsCall(env, "/get", { batchId });
+      const exp = Math.floor(Date.now() / 1000) + 15 * 60;
+      const sig = await labelsSign(secret, batchId, exp);
+      const link = new URL("/labels/dl", url.origin);
+      link.searchParams.set("batchId", batchId); link.searchParams.set("exp", String(exp)); link.searchParams.set("sig", sig);
+      return json({ url: link.toString(), expiresAt: new Date(exp * 1000).toISOString(), size: batch.fileSize || null, filename: labelsFilename(batch) });
     }
     case "/labels/downloaded": {
       let body = {};

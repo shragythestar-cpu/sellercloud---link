@@ -92,3 +92,6 @@ The worker can assemble kits in Sellercloud with the same call Sellercloud's own
   Shipping, Veho, LaserShip, or any other name). Batches show `carrier` (or Mixed / Unknown) and a `carriers` breakdown;
   `?carrier=` filters /labels/batches and /labels/stats; /labels/stats adds spend per carrier. Old batches get theirs from
   their lines.
+- **Label downloads (Nov 24).** `/labels/file` answers `Range: bytes=a-b` with 206 for chunked downloads. `POST
+  /labels/file-link` `{ batchId }` (Hub key) returns a signed link to `/labels/dl` that works for 15 minutes and carries
+  no key; the browser downloads the PDF straight from the worker.
