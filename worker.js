@@ -4614,7 +4614,8 @@ async function labelsDiagSc(env, url) {
   const pick = (o) => {
     const a = o.ShippingAddress || {};
     const items = (o.Items || o.OrderItems || []).map((i) => [i.ProductID || i.ProductIDOriginal || i.SKU || "", i.Qty ?? i.Quantity ?? "", i.QtyShipped ?? ""].join(":"));
-    return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), ((a.FirstName || "") + " " + (a.LastName || "")).trim(), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
+    if (url.searchParams.get("short") === "1") return [o.OrderSourceOrderID || "", String(o.TimeOfOrder || o.CreatedOn || "").slice(0, 16)].join("|");
+    return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), String(o.TimeOfOrder || "").slice(0, 16), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
   };
   if (api === "ids") {
     const day = await labelsCall(env, "/day", { date });
@@ -4622,7 +4623,7 @@ async function labelsDiagSc(env, url) {
     const lines = [];
     for (const b of day.batches || []) for (const l of b.lines || []) {
       if (l.orderId) ids.add(String(l.orderId).trim());
-      lines.push([b.carrier || b.platform || "", l.idx ?? "", l.page ?? "", l.tracking || "", l.orderId || "", l.qty ?? "", String(l.sku || "").slice(0, 50)].join("|"));
+      lines.push([b.carrier || b.platform || "", l.idx ?? "", l.page ?? "", l.tracking || "", l.orderId || "", l.qty ?? ""].join("|"));
     }
     return Response.json({ ids: [...ids], lines });
   }
@@ -4649,8 +4650,9 @@ const N=parseInt(q.get('n')||'20',10);const bad=[];for(let i=0;i<ids.length;i+=N
 if(i===0&&!j.rows.length){pfx='1';j=await get('api=orders&keys=1&pfx=1&ids='+encodeURIComponent(part));}
 if(j.keys)keys=j.keys;rows.push(...j.rows);o.textContent='orders '+rows.length+'/'+ids.length+' bad '+bad.length+' log '+log.slice(-3).join(' / ');}
 const src={};rows.forEach(r=>{const s=r.split('|')[4];src[s]=(src[s]||0)+1;});const ch=Object.entries(src).sort((a,b)=>b[1]-a[1])[0]?.[0]||'';
-const un=[];let total=0;for(let p=1;p<=60;p++){const j=await get('api=unshipped&page='+p+(ch?'&channel='+ch:''));total=j.total;un.push(...j.rows);o.textContent='unshipped '+un.length+'/'+total;if(!j.rows.length||un.length>=total)break;}
-o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.slice(0,20).join(' / '),'BAD '+bad.join(','),'== ORDERS',...rows,'== UNSHIPPED',...un,'== LINES',...lines,'== END'].join('\\n');}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
+const F=q.get('from')||'';const idset=new Set(ids);const un=[];let total=0;for(let p=1;p<=250;p++){const j=await get('api=unshipped&short=1&page='+p+(ch?'&channel='+ch:'')+(F?'&from='+F:''));total=j.total;un.push(...j.rows);o.textContent='unshipped '+un.length+'/'+total;if(!j.rows.length||un.length>=total)break;}
+const nolab={};const nolabList=[];for(const r of un){const [id,t]=r.split('|');if(idset.has(id))continue;const d=t.slice(0,10);nolab[d]=(nolab[d]||0)+1;if(t>=(q.get('since')||'9'))nolabList.push(r);}const un2=['NOLABEL_BY_DAY '+JSON.stringify(nolab),'UNSHIPPED_SEEN '+un.length,...nolabList];
+o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.slice(0,20).join(' / '),'BAD '+bad.join(','),'== ORDERS',...rows,'== UNSHIPPED',...un2,'== LINES',...lines,'== END'].join('\\n');}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
 <\/script>`;
     return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
   }
