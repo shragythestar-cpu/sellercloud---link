@@ -5844,7 +5844,8 @@ async function temuBacklogRoute(env, url) {
     // Orders with a label in the last 30 days: how they stand in Sellercloud now.
     const pos = [...(await temuLabelPos(env))];
     const out = { labelOrders: pos.length, unshipped: 0, shippedWithTracking: 0, shippedNoTracking: [], notFound: 0, other: 0 };
-    for (let i = 0; i < pos.length && Date.now() < deadline - 3000; i += 25) {
+    const from = Math.max(0, parseInt(url.searchParams.get("from") || "0", 10) || 0); out.from = from;
+    for (let i = from; i < pos.length && Date.now() < deadline - 3000; i += 25) {
       const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: pos.slice(i, i + 25) });
       const got = new Map((data.Items || []).map((o) => [String(o.OrderSourceOrderID), o]));
       for (const po of pos.slice(i, i + 25)) {
@@ -5876,6 +5877,15 @@ async function temuBacklogRoute(env, url) {
       else { const k = [o.CompanyID, o.ShippingStatus, o.StatusCode, temuNyDay(o.TimeOfOrder) < cutoff ? "old" : "new"].join("/"); why[k] = (why[k] || 0) + 1; }
     }
     return Response.json({ total, page, size, rows: items.length, eligible: elig, byMonth: days, notEligible: why });
+  }
+  if (api === "overlappage") {
+    return new Response(`<!doctype html><title>overlap</title><pre id=o>starting</pre><script>
+(async()=>{const T=${JSON.stringify(t)};let from=0,tot={unshipped:0,shippedWithTracking:0,notFound:0,other:0,noTr:[]},n=0;
+for(;;){let j;try{j=await (await fetch('?t='+T+'&api=overlap&from='+from)).json();}catch(e){await new Promise(r=>setTimeout(r,3000));continue;}
+tot.unshipped+=j.unshipped;tot.shippedWithTracking+=j.shippedWithTracking;tot.notFound+=j.notFound;tot.other+=j.other;tot.noTr.push(...j.shippedNoTracking);n=j.labelOrders;
+document.getElementById('o').textContent=(j.checked>=n?'DONE ':'')+'checked '+j.checked+' of '+n+' '+JSON.stringify({unshipped:tot.unshipped,withTracking:tot.shippedWithTracking,notFound:tot.notFound,other:tot.other,shippedNoTracking:tot.noTr.length,sample:tot.noTr.slice(0,10)});
+if(!j.checked||j.checked>=n)break;from=j.checked;}})();
+</script>`, { headers: { "content-type": "text/html" } });
   }
   if (api === "drypage") {
     const html = `<!doctype html><meta charset="utf-8"><title>dry</title><pre id="o">working…</pre><script>
