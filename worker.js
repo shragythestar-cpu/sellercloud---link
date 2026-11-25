@@ -88,7 +88,7 @@
 //     learned read-only from one Sellercloud order per product title and kept in KV labels:titlesku:v1); GET /labels/upc?upc= (Sellercloud
 //     products with that UPC, read-only, kept 7 days in KV, plus saved links); POST /labels/printed {items:[{batchId,pkg}],by};
 //     POST /labels/link {upc,sku[,remove]}. The page prints a scanned product's labels grouped by units per package.
-//     GET /labels/photo?sku= (read-only: the product's photo link from Sellercloud, also tried without the platform name; kept 7 days in KV; none kept 1 day).
+//     GET /labels/photo?sku= (read-only: the catalog image, else Sellercloud product images; also tried without the platform name; kept 7 days in KV; none kept 1 hour).
 //   /assemble/platforms  (ASSEMBLE_KEY) platforms for "Create final SKU": prefix and company each (company: Text PLATFORM_COMPANY_<KEY>)
 //   POST /assemble/create-product {sku,name?,platform? or companyName/companyId,sourceSku?,productType?,itemId?}
 //     (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes) creates ONE product in that company. Refuses an SKU that exists
@@ -4617,6 +4617,14 @@ async function labelsDiagSc(env, url) {
     if (url.searchParams.get("short") === "1") return [o.OrderSourceOrderID || "", String(o.TimeOfOrder || o.CreatedOn || "").slice(0, 16)].join("|");
     return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), String(o.TimeOfOrder || "").slice(0, 16), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
   };
+  if (api === "photo") return Response.json(await labelsPhoto(env, (url.searchParams.get("sku") || "").trim()));
+  if (api === "day") {
+    const day = await labelsCall(env, "/day", { date });
+    await labelsAddScSkus(env, day, date);
+    const by = {};
+    for (const b of day.batches || []) for (const l of b.lines || []) { const k = String(l.sku || "").slice(0, 40); by[k] = l.scSku || null; }
+    return Response.json({ titles: Object.keys(by).length, missing: Object.entries(by).filter(([, v]) => !v).map(([k]) => k), sample: Object.entries(by).slice(0, 15) });
+  }
   if (api === "ids") {
     const day = await labelsCall(env, "/day", { date });
     const ids = new Set();
@@ -4915,6 +4923,34 @@ async function labelsAddScSkus(env, day, date) {
     l.scSku = v && !v.startsWith("?") ? v : null;
   }
 }
+// A product's photo link: the catalog image (as the Hub's product search shows it), else Sellercloud's product images;
+// the channel SKU first, then the same SKU without the platform name. Kept 7 days in KV (none: 1 hour).
+async function labelsPhoto(env, sku) {
+  const ck = `labels:photo2:${sku.toLowerCase()}`;
+  const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck) : null;
+  if (hit !== null) return { sku, url: hit || null, cached: true };
+  let photo = null;
+  const tried = [];
+  try {
+    for (const id of [...new Set([sku, labelsBaseSku(sku)])].filter(Boolean)) {
+      const data = await scGet(env, "/catalog", { SKU: [id], pageNumber: 1, pageSize: 5 });
+      const p = (data.Items || []).find((x) => String(x.ID ?? x.ProductID ?? "").toLowerCase() === id.toLowerCase());
+      tried.push(id + (p ? "" : " (no product)"));
+      photo = (p && /^https?:\/\//i.test(String(p.ImageUrl || "")) && String(p.ImageUrl)) || null;
+      if (photo) break;
+      const img = await scGet(env, "/ProductImage", { productID: id }).catch(() => null);
+      const list = Array.isArray(img) ? img : img?.Images || img?.Items || [];
+      const pick = list.find((i) => i?.IsDefault && i?.Url) || list.find((i) => i?.Url);
+      photo = pick?.Url && /^https?:\/\//i.test(pick.Url) ? pick.Url : null;
+      if (photo) break;
+    }
+  } catch (e) {
+    return { sku, url: null, error: String(e?.message || e).slice(0, 200), tried };
+  }
+  if (photo) photo = photo.replace(/^http:\/\//i, "https://");
+  if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, photo || "", { expirationTtl: photo ? 7 * 86400 : 3600 });
+  return { sku, url: photo, tried };
+}
 async function scanRoute(request, env, path, url) {
   const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
   switch (path) {
@@ -4933,27 +4969,10 @@ async function scanRoute(request, env, path, url) {
       return json({ ...found, links, skuKeys: [...new Set([...found.products.map((p) => scanSkuKey(p.sku)), ...links.map(scanSkuKey)].filter(Boolean))] });
     }
     case "/labels/photo": {
-      // Read-only: a product's photo for the Hub's FBM printing list (default image, else the first).
+      // Read-only: a product's photo for the Hub's FBM printing list.
       const sku = (url.searchParams.get("sku") || "").trim().slice(0, 100);
       if (!sku) return json({ error: "Add ?sku=..." }, 400);
-      const ck = `labels:photo:${sku.toLowerCase()}`;
-      const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck) : null;
-      if (hit !== null) return json({ sku, url: hit || null, cached: true });
-      let photo = null;
-      try {
-        // The channel SKU first (e.g. "TEMU - M&Ms Peanut butter"), then the same SKU without the platform name.
-        for (const id of [...new Set([sku, labelsBaseSku(sku)])].filter(Boolean)) {
-          const data = await scGet(env, "/ProductImage", { productID: id });
-          const list = Array.isArray(data) ? data : data?.Images || data?.Items || [];
-          const pick = list.find((i) => i?.IsDefault && i?.Url) || list.find((i) => i?.Url);
-          photo = pick?.Url || null;
-          if (photo) break;
-        }
-      } catch (e) {
-        return json({ sku, url: null, error: String(e?.message || e).slice(0, 200) });
-      }
-      if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, photo || "", { expirationTtl: photo ? 7 * 86400 : 86400 });
-      return json({ sku, url: photo });
+      return json(await labelsPhoto(env, sku));
     }
     case "/labels/printed": {
       const items = Array.isArray(body.items) ? body.items.slice(0, 2000) : [];
