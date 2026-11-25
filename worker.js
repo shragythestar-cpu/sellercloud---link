@@ -87,6 +87,7 @@
 //     GET /labels/day?date= (the day's batches, lines, printed packages, UPC links); GET /labels/upc?upc= (Sellercloud
 //     products with that UPC, read-only, kept 7 days in KV, plus saved links); POST /labels/printed {items:[{batchId,pkg}],by};
 //     POST /labels/link {upc,sku[,remove]}. The page prints a scanned product's labels grouped by units per package.
+//     GET /labels/photo?sku= (read-only: the product's photo link from Sellercloud, kept 7 days in KV; none kept 1 day).
 //   /assemble/platforms  (ASSEMBLE_KEY) platforms for "Create final SKU": prefix and company each (company: Text PLATFORM_COMPANY_<KEY>)
 //   POST /assemble/create-product {sku,name?,platform? or companyName/companyId,sourceSku?,productType?,itemId?}
 //     (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes) creates ONE product in that company. Refuses an SKU that exists
@@ -4743,6 +4744,25 @@ async function scanRoute(request, env, path, url) {
       const found = await scanUpcProducts(env, upc);
       const { links } = await labelsCall(env, "/links", { upc: upcKey(upc) });
       return json({ ...found, links, skuKeys: [...new Set([...found.products.map((p) => scanSkuKey(p.sku)), ...links.map(scanSkuKey)].filter(Boolean))] });
+    }
+    case "/labels/photo": {
+      // Read-only: a product's photo for the Hub's FBM printing list (default image, else the first).
+      const sku = (url.searchParams.get("sku") || "").trim().slice(0, 100);
+      if (!sku) return json({ error: "Add ?sku=..." }, 400);
+      const ck = `labels:photo:${sku.toLowerCase()}`;
+      const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck) : null;
+      if (hit !== null) return json({ sku, url: hit || null, cached: true });
+      let photo = null;
+      try {
+        const data = await scGet(env, "/ProductImage", { productID: sku });
+        const list = Array.isArray(data) ? data : data?.Images || data?.Items || [];
+        const pick = list.find((i) => i?.IsDefault && i?.Url) || list.find((i) => i?.Url);
+        photo = pick?.Url || null;
+      } catch (e) {
+        return json({ sku, url: null, error: String(e?.message || e).slice(0, 200) });
+      }
+      if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, photo || "", { expirationTtl: photo ? 7 * 86400 : 86400 });
+      return json({ sku, url: photo });
     }
     case "/labels/printed": {
       const items = Array.isArray(body.items) ? body.items.slice(0, 2000) : [];
