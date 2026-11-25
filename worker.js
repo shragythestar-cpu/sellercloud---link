@@ -4653,6 +4653,12 @@ async function labelsDiagSc(env, url, request) {
     for (const b of day.batches || []) for (const l of b.lines || []) { const k = String(l.sku || "").slice(0, 40); by[k] = l.scSku || null; }
     return Response.json({ titles: Object.keys(by).length, missing: Object.entries(by).filter(([, v]) => !v).map(([k]) => k), sample: Object.entries(by).slice(0, 15) });
   }
+  if (api === "dump") {
+    const day = await labelsCall(env, "/day", { date });
+    const v = JSON.stringify(day);
+    if (env.DIAG_DB) await env.DIAG_DB.prepare("INSERT OR REPLACE INTO diag (k, v, at) VALUES (?, ?, ?)").bind("day", v, new Date().toISOString()).run();
+    return Response.json({ saved: v.length, batches: (day.batches || []).map((b) => ({ id: b.batchId, carrier: b.carrier, platform: b.platform, name: b.fileName || b.name || "", lines: (b.lines || []).length, keys: Object.keys(b).join(","), lineKeys: Object.keys((b.lines || [])[0] || {}).join(",") })) });
+  }
   if (api === "ids") {
     const day = await labelsCall(env, "/day", { date });
     const ids = new Set();
