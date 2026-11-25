@@ -5,6 +5,8 @@
 // The one exception is kit assembly (POST /assemble), which changes stock and stays SWITCHED OFF
 // until ASSEMBLE_ENABLED = yes. See the "Kit assembly" section below.
 // Second exception (Nov 25): /temu-backlog marks old unshipped Temu orders shipped, only while switched on. See "Temu backlog".
+// Third exception (Nov 25): /labels-autoship marks a Temu order shipped once its label is printed, only while switched on
+// (plus a one-order test call). See "Labels auto mark shipped".
 // Its only writes are to ONE monday board, "Sellercloud Products" (SYNC_BOARD_ID), never the
 // Production Schedule boards, and posts to ONE Google Chat space (CHAT_WEBHOOK) from /pull.
 //
@@ -3713,6 +3715,7 @@ async function handle(request, env) {
   }
   if (p0 === "/labels-diag") return labelsDiag(env, url, request);
   if (p0 === "/temu-backlog") return temuBacklogRoute(env, url);
+  if (p0 === "/labels-autoship") return autoshipRoute(env, url);
   if (p0 === "/labels/dl") {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Only GET is allowed here.", { status: 405 });
     return labelsDirect(request, env, url);
@@ -5025,7 +5028,10 @@ async function scanRoute(request, env, path, url) {
       const clean = items.map((x) => ({ batchId: String(x?.batchId || "").trim(), pkg: String(x?.pkg || "").trim().slice(0, 120) }))
         .filter((x) => /^[A-Za-z0-9._-]{1,80}$/.test(x.batchId) && x.pkg);
       if (!clean.length) return json({ error: "items (batchId and pkg each) are needed." }, 400);
-      return json(await labelsCall(env, "/printed", { items: clean, by: String(body.by || "").trim().slice(0, 100) || "Scan station" }));
+      const done = await labelsCall(env, "/printed", { items: clean, by: String(body.by || "").trim().slice(0, 100) || "Scan station" });
+      // Auto mark shipped (switched off unless turned on): queue the printed packages for the timer.
+      try { await autoshipEnqueue(env, clean, String(body.by || "").trim().slice(0, 100)); } catch (e) { console.log("autoship queue failed: " + e.message); }
+      return json(done);
     }
     case "/labels/link": {
       const upc = upcKey(body.upc);
@@ -5528,6 +5534,139 @@ async function mirrorStatus(env) {
   return { enabled: mirrorOn(env), lastRun: last, lastError: last?.error || null, counts, items };
 }
 
+// ── Labels auto mark shipped (Nov 25, Shragy's ask): when the Hub marks a Temu label printed, mark that order shipped in
+// Sellercloud with the label's carrier, service and tracking. SWITCHED OFF until turned on (KV labels:autoship, on:false).
+// Uses the shared scMarkShipped helper (see Temu backlog). Only orders that are ALL of: Temu company (372), Unshipped,
+// Processing, and with no other tracking number in Sellercloud. The print call only queues; the 2-minute timer ships.
+// Control: GET /labels-autoship?t=<token>&api=status|preview|ship1|on|off  (preview/ship1 take &po=<Temu order>&date=YYYY-MM-DD).
+// ship1 marks exactly one order and works while switched off: it is the one-order test.
+const AUTOSHIP_HASH = "5f6bb20f1d2334550c1c37fd9019b2332978a137f1122ed259aac0b404c1927c";
+const AUTOSHIP_STATE = "labels:autoship";
+const AUTOSHIP_QUEUE = "labels:autoship:queue";
+const AUTOSHIP_TICK_MAX = 60;
+const autoshipNorm = (t) => String(t || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+async function autoshipState(env) { return (env.TOKEN_KV && (await env.TOKEN_KV.get(AUTOSHIP_STATE, "json"))) || { on: false, shipped: 0, skipped: [], failed: [], log: [] }; }
+async function autoshipSave(env, st) { if (env.TOKEN_KV) await env.TOKEN_KV.put(AUTOSHIP_STATE, JSON.stringify(st)); }
+async function autoshipEnqueue(env, items, by) {
+  const st = await autoshipState(env);
+  if (!st.on || !env.TOKEN_KV) return;
+  const q = (await env.TOKEN_KV.get(AUTOSHIP_QUEUE, "json")) || [];
+  const at = new Date().toISOString();
+  for (const x of items) q.push({ batchId: x.batchId, pkg: x.pkg, at, by: by || "" });
+  await env.TOKEN_KV.put(AUTOSHIP_QUEUE, JSON.stringify(q.slice(-5000)));
+}
+const autoshipCarrier = (c) => (/^ups$/i.test(c) ? "UPS" : /^usps$/i.test(c) ? "USPS" : /^fedex$/i.test(c) ? "FedEx" : "Other");
+// Lines of one package, grouped exactly as the Hub's packagesOfBatch does: a tracking number is one package ("t:<tracking>"),
+// and a line with no tracking either starts its own package ("i:<idx>") or joins the line before it.
+function autoshipLines(batch, pkg) {
+  const by = new Map(); let cur = null, ct = false;
+  for (const l of [...(batch?.lines || [])].sort((a, c) => a.idx - c.idx)) {
+    const t = autoshipNorm(l.tracking);
+    if (t) { const k = "t:" + t; if (!by.has(k)) by.set(k, []); by.get(k).push(l); cur = k; ct = true; continue; }
+    if (!cur || ct || (l.cost || 0) > 0) { const k = "i:" + l.idx; by.set(k, [l]); cur = k; ct = false; }
+    else by.get(cur).push(l);
+  }
+  return by.get(pkg) || [];
+}
+// Plan for a list of {batchId,pkg}: one entry per Temu order with its label, and the Sellercloud order checks.
+async function autoshipPlan(env, pkgs) {
+  const days = new Map();
+  const out = [];
+  for (const p of pkgs) {
+    const date = String(p.batchId || "").slice(0, 10);
+    if (!isDay(date)) { out.push({ ...p, skip: "batch has no date" }); continue; }
+    if (!days.has(date)) days.set(date, await labelsCall(env, "/day", { date }));
+    const batch = (days.get(date).batches || []).find((b) => b.batchId === p.batchId);
+    const ls = autoshipLines(batch, p.pkg);
+    const orders = [...new Set(ls.map((l) => String(l.orderId || "").trim()).filter(Boolean))];
+    const tr = [...new Set(ls.map((l) => String(l.tracking || "").trim()).filter(Boolean))];
+    if (!ls.length) out.push({ ...p, skip: "label not found in the day's file" });
+    else if (orders.length !== 1) out.push({ ...p, skip: orders.length ? "one label for several orders" : "no Temu order number on the label" });
+    else if (tr.length !== 1) out.push({ ...p, po: orders[0], skip: "no single tracking number on the label" });
+    else out.push({ ...p, po: orders[0], tracking: tr[0], carrier: autoshipCarrier(ls[0].carrier || batch.carrier), service: String(ls[0].service || "").slice(0, 60) });
+  }
+  const want = out.filter((x) => !x.skip);
+  const sc = new Map();
+  for (let i = 0; i < want.length; i += 25) {
+    const ids = [...new Set(want.slice(i, i + 25).map((x) => x.po))];
+    const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids });
+    for (const o of data.Items || []) sc.set(String(o.OrderSourceOrderID), o);
+  }
+  for (const x of want) {
+    const o = sc.get(x.po);
+    if (!o) { x.skip = "Temu order not found in Sellercloud"; continue; }
+    x.scId = o.ID; x.items = (o.Items || o.OrderItems || []).map((i) => (i.ProductID || i.SKU || "") + " x" + (i.Qty ?? i.Quantity ?? "")).join(" + ");
+    const have = [o.TrackingNumber, ...(o.AllTrackingNumbers || [])].map(autoshipNorm).filter(Boolean);
+    if (Number(o.CompanyID) !== TEMUSHIP_COMPANY) x.skip = "not a Temu order (company " + o.CompanyID + ")";
+    else if (!temuUnshipped(o.ShippingStatus)) x.skip = "already not Unshipped in Sellercloud (" + o.ShippingStatus + ")";
+    else if (!temuProcessing(o.StatusCode)) x.skip = "order status is " + o.StatusCode + ", not Processing";
+    else if (have.some((h) => h !== autoshipNorm(x.tracking))) x.skip = "Sellercloud already has another tracking number";
+  }
+  return out;
+}
+async function autoshipShip(env, x) {
+  const r = await scMarkShipped(env, x.scId, { carrier: x.carrier, service: x.service, tracking: x.tracking });
+  let after = null;
+  try {
+    const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 5, orderSourceOrderIDList: [x.po] });
+    const o = (data.Items || [])[0];
+    if (o) after = { shippingStatus: o.ShippingStatus, tracking: o.TrackingNumber || "", carrier: o.ShippingCarrier ?? o.CarrierName ?? null, service: o.ShippingService ?? o.ShippingMethod ?? null };
+  } catch {}
+  return { ...x, ok: !!r.ok && !!after && !temuUnshipped(after.shippingStatus), status: r.status, said: r.said, after };
+}
+async function autoshipTick(env) {
+  const st = await autoshipState(env);
+  if (!st.on || !env.TOKEN_KV) return;
+  const q = (await env.TOKEN_KV.get(AUTOSHIP_QUEUE, "json")) || [];
+  if (!q.length) return;
+  const take = q.slice(0, AUTOSHIP_TICK_MAX);
+  await env.TOKEN_KV.put(AUTOSHIP_QUEUE, JSON.stringify(q.slice(take.length)));
+  const plan = await autoshipPlan(env, take);
+  for (const x of plan) {
+    if (x.skip) { st.skipped = [...(st.skipped || []), { po: x.po || null, pkg: x.pkg, why: x.skip, at: new Date().toISOString() }].slice(-500); continue; }
+    const r = await autoshipShip(env, x).catch((e) => ({ ...x, ok: false, said: String(e.message || e).slice(0, 200) }));
+    if (r.ok) st.shipped = (st.shipped || 0) + 1;
+    else st.failed = [...(st.failed || []), { po: x.po, tracking: x.tracking, status: r.status || null, said: (r.said || "").slice(0, 200), after: r.after || null }].slice(-300);
+    st.log = [...(st.log || []), { po: x.po, tracking: x.tracking, ok: !!r.ok, at: new Date().toISOString() }].slice(-300);
+  }
+  const fresh = await autoshipState(env);
+  await autoshipSave(env, { ...st, on: fresh.on });
+}
+async function autoshipRoute(env, url) {
+  const t = (url.searchParams.get("t") || "").trim();
+  const h = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (!t || !safeEqual(h, AUTOSHIP_HASH)) return new Response("Not found.", { status: 404 });
+  deadline = Date.now() + 25_000;
+  const api = url.searchParams.get("api") || "status";
+  if (api === "status") {
+    const st = await autoshipState(env);
+    const q = (env.TOKEN_KV && (await env.TOKEN_KV.get(AUTOSHIP_QUEUE, "json"))) || [];
+    return Response.json({ ...st, queued: q.length });
+  }
+  if (api === "on" || api === "off") { const st = await autoshipState(env); st.on = api === "on"; await autoshipSave(env, st); return Response.json(st); }
+  if (api === "preview" || api === "ship1") {
+    const po = (url.searchParams.get("po") || "").trim();
+    const date = (url.searchParams.get("date") || "").trim();
+    if (!po || !isDay(date)) return Response.json({ error: "add &po=<Temu order>&date=YYYY-MM-DD" }, { status: 400 });
+    const day = await labelsCall(env, "/day", { date });
+    const pk = [];
+    for (const b of day.batches || []) for (const l of b.lines || []) if (String(l.orderId || "").trim() === po) {
+      const k = autoshipNorm(l.tracking) ? "t:" + autoshipNorm(l.tracking) : (() => { for (const c of b.lines) { const kk = "i:" + c.idx; if (autoshipLines(b, kk).includes(l)) return kk; } return "i:" + l.idx; })();
+      if (!pk.some((p) => p.batchId === b.batchId && p.pkg === k)) pk.push({ batchId: b.batchId, pkg: k });
+    }
+    if (pk.length !== 1) return Response.json({ error: pk.length ? "this order has " + pk.length + " labels; ship1 only takes one" : "no label for this order on " + date }, { status: 400 });
+    const [x] = await autoshipPlan(env, pk);
+    if (api === "preview" || x.skip) return Response.json({ plan: x });
+    const r = await autoshipShip(env, x);
+    const st = await autoshipState(env);
+    st.log = [...(st.log || []), { po: x.po, tracking: x.tracking, ok: !!r.ok, test: true, at: new Date().toISOString() }].slice(-300);
+    if (r.ok) st.shipped = (st.shipped || 0) + 1;
+    await autoshipSave(env, st);
+    return Response.json({ result: r });
+  }
+  return Response.json({ error: "api must be status, preview, ship1, on or off" }, { status: 400 });
+}
+
 // ── Temu backlog: mark old unshipped Temu orders shipped in Sellercloud (Nov 25, Shragy's ask) ──
 // Sellercloud isn't linked back to Temu, so this only changes Sellercloud's own record. Carrier Other, method Freight,
 // no tracking (none is held for these orders). Only orders that are ALL of: company Temu (372), Unshipped, Processing,
@@ -5746,6 +5885,8 @@ export default {
       .finally(() => tallyCalls(env)));
     // Temu backlog (Nov 25): ships a few hundred old Temu orders a tick while switched on.
     ctx.waitUntil(temuBacklogTick(env).catch((e) => console.log("temu backlog failed: " + e.message)));
+    // Labels auto mark shipped (Nov 25): ships orders whose labels were printed, only while switched on.
+    ctx.waitUntil(autoshipTick(env).catch((e) => console.log("labels autoship failed: " + e.message)));
     // Background kit runs: a nudge so the queue's alarm is never lost.
     if (env.JOBS) ctx.waitUntil(jobCall(env, "/kick", {}).catch(() => {}));
   },
