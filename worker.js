@@ -3723,7 +3723,7 @@ async function handle(request, env) {
   // The scan station lives in the Production Hub's FBM printing tab (Nov 25, Shragy: "i need it in the hub only").
   if (p0 === "/scan") return new Response("The scan station is in the Production Hub, tab FBM printing.", { status: 410, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
   if (p0.startsWith("/labels/")) {
-    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link" || p0 === "/labels/printed" || p0 === "/labels/link";
+    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link" || p0 === "/labels/printed" || p0 === "/labels/link" || p0 === "/labels/check" || p0 === "/labels/aside";
     if (request.method !== (wantPost ? "POST" : "GET")) return json({ error: wantPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
     const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
     const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
@@ -5009,7 +5009,26 @@ async function scanRoute(request, env, path, url) {
       const day = await labelsCall(env, "/day", { date });
       // Each line gets scSku, the Sellercloud SKU of its product (uploads carry the product title as sku).
       try { await labelsAddScSkus(env, day, date); } catch (e) { day.scSkuError = String(e?.message || e).slice(0, 200); }
+      // Labels check results (Check button), by "batchId|pkg".
+      day.checks = await labelsChecks(env, date);
       return json(day);
+    }
+    case "/labels/check": {
+      // Read only in Sellercloud: checks the given label packages (or all of the day's) and keeps the results.
+      const date = String(body.date || "").trim();
+      if (!isDay(date)) return json({ error: "Add date as YYYY-MM-DD." }, 400);
+      const items = Array.isArray(body.items) ? body.items.slice(0, 600).map((x) => ({ batchId: String(x?.batchId || "").trim(), pkg: String(x?.pkg || "").trim().slice(0, 120) })).filter((x) => x.batchId && x.pkg) : null;
+      deadline = Date.now() + 25_000;
+      const r = await labelsCheckRun(env, date, { want: items });
+      return json({ date, results: r.results.map(({ scId, carrier, service, ...x }) => x), partial: r.partial, unchecked: r.unchecked });
+    }
+    case "/labels/aside": {
+      // Sets aside (aside: true) or brings back not-good labels; good labels are never set aside.
+      const date = String(body.date || "").trim();
+      if (!isDay(date)) return json({ error: "Add date as YYYY-MM-DD." }, 400);
+      const items = Array.isArray(body.items) ? body.items.slice(0, 2000).map((x) => ({ batchId: String(x?.batchId || "").trim(), pkg: String(x?.pkg || "").trim().slice(0, 120) })).filter((x) => x.batchId && x.pkg) : [];
+      const changed = await labelsAside(env, date, items, body.aside !== false);
+      return json({ ok: true, changed, checks: await labelsChecks(env, date) });
     }
     case "/labels/upc": {
       const upc = (url.searchParams.get("upc") || "").trim();
@@ -5534,6 +5553,213 @@ async function mirrorStatus(env) {
   return { enabled: mirrorOn(env), lastRun: last, lastError: last?.error || null, counts, items };
 }
 
+// ── Labels check (Nov 25, Shragy: a Check button per product line in the Hub's Today's products). READ ONLY in Sellercloud.
+// For each label package: the Temu order exists in Sellercloud, it is a Temu order, the product and qty on the label match
+// what Sellercloud says the order holds, it is one product (not mixed), it is Unshipped and Processing (or already shipped
+// with this same label's tracking), and it has no other tracking number and no second label today. Results are kept per
+// day in KV (labels:check:<date>) and come back with /labels/day as "checks". A not-good label can be set aside
+// (/labels/aside): the Hub then lists it under "Needs fixing" with a packing slip built from Sellercloud.
+// Product match, in order: the order's product name in Sellercloud (Temu's title) starts with the same first six words as
+// the label's product; else the products whose Sellercloud names match the label's title; else the label's mapped SKU;
+// else most words shared; else the SKU most of this title's single-product orders have.
+const LCHK_KEY = (d) => "labels:check:" + d;
+const LNAMES_KEY = "labels:names:v1";
+const LSTOP = new Set(["s", "m", "the", "and", "of", "for", "with", "a", "pack", "count", "oz", "bulk", "bag"]);
+const lToks = (t) => String(t || "").toLowerCase().replace(/’/g, "'").replace(/[^a-z0-9]+/g, " ").split(" ").filter((w) => w.length > 1 && !LSTOP.has(w));
+function lSame(a, b, n = 6) {
+  const x = lToks(a), y = lToks(b);
+  const k = Math.min(n, x.length, y.length);
+  if (!k) return false;
+  for (let i = 0; i < k; i++) if (x[i] !== y[i]) return false;
+  return true;
+}
+function lOverlap(a, b) {
+  const x = new Set(lToks(a)), y = new Set(lToks(b));
+  let n = 0;
+  for (const w of x) if (y.has(w)) n++;
+  return n / Math.max(1, Math.min(x.size, y.size));
+}
+const LSPANISH = ["de", "en", "para", "con", "del", "la", "los", "las"];
+const lSpanish = (t) => { const s = new Set(lToks(t)); return LSPANISH.filter((w) => s.has(w)).length >= 2; };
+const lShort = (t, n = 7) => String(t || "").trim().split(/\s+/).slice(0, n).join(" ");
+// Packages of one batch, grouped exactly as the Hub's packagesOfBatch: key -> lines.
+function labelsPackages(batch) {
+  const by = new Map(); let cur = null, ct = false;
+  for (const l of [...(batch?.lines || [])].sort((a, c) => a.idx - c.idx)) {
+    const t = autoshipNorm(l.tracking);
+    if (t) { const k = "t:" + t; if (!by.has(k)) by.set(k, []); by.get(k).push(l); cur = k; ct = true; continue; }
+    if (!cur || ct || (l.cost || 0) > 0) { const k = "i:" + l.idx; by.set(k, [l]); cur = k; ct = false; }
+    else by.get(cur).push(l);
+  }
+  return by;
+}
+async function labelsChecks(env, date) {
+  try { return (env.TOKEN_KV && (await env.TOKEN_KV.get(LCHK_KEY(date), "json"))) || {}; } catch { return {}; }
+}
+// opts: { want: [{batchId,pkg}] | null (all), batchId, onlyNew }. Returns { results, partial, unchecked (ids), found (ids) }.
+async function labelsCheckRun(env, date, opts = {}) {
+  const day = await labelsCall(env, "/day", { date });
+  try { await labelsAddScSkus(env, day, date); } catch {}
+  const all = [];
+  const perOrder = new Map();
+  for (const b of day.batches || []) {
+    for (const [pkg, lines] of labelsPackages(b)) {
+      all.push({ batchId: b.batchId, pkg, lines, carrier: b.carrier || "" });
+      for (const o of new Set(lines.map((l) => String(l.orderId || "").trim()).filter(Boolean))) perOrder.set(o, (perOrder.get(o) || 0) + 1);
+    }
+  }
+  const stored = await labelsChecks(env, date);
+  const wantSet = opts.want ? new Set(opts.want.map((x) => x.batchId + "|" + x.pkg)) : null;
+  let todo = all.filter((p) => (!wantSet || wantSet.has(p.batchId + "|" + p.pkg)) && (!opts.batchId || p.batchId === opts.batchId));
+  if (opts.onlyNew) todo = todo.filter((p) => !stored[p.batchId + "|" + p.pkg]);
+  const ids = [...new Set(todo.flatMap((p) => p.lines.map((l) => String(l.orderId || "").trim())).filter(Boolean))];
+  const sc = new Map(); const asked = new Set(); let partial = false;
+  for (let i = 0; i < ids.length; i += 25) {
+    if (Date.now() > deadline - 5000) { partial = true; break; }
+    const part = ids.slice(i, i + 25);
+    const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: part });
+    for (const o of data.Items || []) sc.set(String(o.OrderSourceOrderID || "").trim(), o);
+    for (const x of part) asked.add(x);
+  }
+  const itemsOf = (o) => {
+    const m = new Map();
+    for (const i of o.Items || o.OrderItems || []) {
+      const sku = String(i.ProductID || i.SKU || "").trim();
+      if (!sku) continue;
+      const q = Number(i.Qty ?? i.Quantity) || 0;
+      const prev = m.get(sku);
+      if (prev) prev.qty += q; else m.set(sku, { sku, name: String(i.DisplayName || i.ProductName || "").trim().slice(0, 200), qty: q });
+    }
+    return [...m.values()];
+  };
+  // Names Sellercloud gives each SKU (kept across checks, so a short product line can still be compared).
+  let names = {};
+  try { names = (env.TOKEN_KV && (await env.TOKEN_KV.get(LNAMES_KEY, "json"))) || {}; } catch { names = {}; }
+  let namesChanged = false;
+  for (const o of sc.values()) for (const it of itemsOf(o)) {
+    if (!it.name) continue;
+    const ns = names[it.sku] || [];
+    if (!ns.includes(it.name) && ns.length < 8) { names[it.sku] = [...ns, it.name]; namesChanged = true; }
+  }
+  const titleSkus = new Map();
+  const skusForTitle = (t) => {
+    if (titleSkus.has(t)) return titleSkus.get(t);
+    const s = new Set();
+    for (const [sku, ns] of Object.entries(names)) if (ns.some((n) => lSame(t, n))) s.add(sku);
+    titleSkus.set(t, s);
+    return s;
+  };
+  const titleOf = (p) => String(p.lines[0]?.productName || p.lines[0]?.sku || "");
+  const majority = new Map();
+  for (const p of todo) {
+    const o = sc.get(String(p.lines[0]?.orderId || "").trim());
+    if (!o) continue;
+    const it = itemsOf(o);
+    if (it.length !== 1) continue;
+    const t = labelsTitle(titleOf(p));
+    const m = majority.get(t) || new Map();
+    m.set(it[0].sku, (m.get(it[0].sku) || 0) + 1);
+    majority.set(t, m);
+  }
+  const at = new Date().toISOString();
+  const results = []; const unchecked = [];
+  for (const p of todo) {
+    const id = p.batchId + "|" + p.pkg;
+    const orders = [...new Set(p.lines.map((l) => String(l.orderId || "").trim()).filter(Boolean))];
+    const tracks = [...new Set(p.lines.map((l) => autoshipNorm(l.tracking)).filter(Boolean))];
+    const labelQty = p.lines.reduce((s, l) => s + (Number(l.qty) || 0), 0);
+    const title = titleOf(p);
+    const labelSkus = [...new Set(p.lines.map((l) => l.scSku || labelsTitle(l.sku)))];
+    const r = { id, batchId: p.batchId, pkg: p.pkg, po: orders[0] || "", title: title.slice(0, 200), labelSku: p.lines[0]?.scSku || "",
+      labelQty, tracking: String(p.lines.find((l) => autoshipNorm(l.tracking))?.tracking || "").trim(), carrier: autoshipCarrier(p.lines[0]?.carrier || p.carrier), service: String(p.lines[0]?.service || "").slice(0, 60),
+      good: false, kind: "", shipped: false, reasons: [], items: [], scId: null, at };
+    const other = (t) => { r.reasons.push(t); r.kind = "other"; };
+    if (orders.length === 1 && !asked.has(orders[0])) { unchecked.push(id); continue; }
+    if (!orders.length) other("no Temu order number on this label");
+    else if (orders.length > 1) other("one label for " + orders.length + " orders");
+    const o = orders.length === 1 ? sc.get(orders[0]) : null;
+    if (orders.length === 1 && !o) other("Temu order not found in Sellercloud");
+    if (o) {
+      r.scId = o.ID;
+      r.items = itemsOf(o);
+      const have = [o.TrackingNumber, ...(o.AllTrackingNumbers || [])].map(autoshipNorm).filter(Boolean);
+      const mine = tracks.length === 1 ? tracks[0] : "";
+      if (Number(o.CompanyID) !== TEMUSHIP_COMPANY) other("not a Temu order in Sellercloud");
+      if (!temuUnshipped(o.ShippingStatus)) {
+        if (mine && have.includes(mine)) r.shipped = true;
+        else other("already marked shipped in Sellercloud " + (have.length ? "with another tracking number" : "with no tracking"));
+      } else {
+        if (have.some((h) => h !== mine)) other("Sellercloud already has another tracking number");
+        if (!temuProcessing(o.StatusCode)) other("Sellercloud order status is " + o.StatusCode + ", not Processing");
+      }
+      if ((perOrder.get(orders[0]) || 0) > 1) other("this order has " + perOrder.get(orders[0]) + " labels today");
+      if (r.items.length > 1) {
+        r.reasons.push("mixed order: " + r.items.length + " different products in one box, pack by hand");
+        if (r.kind !== "other") r.kind = "mixed";
+      } else if (r.items.length === 1) {
+        const it = r.items[0];
+        if (labelSkus.length > 1) {
+          r.reasons.push("the label lists " + labelSkus.length + " products but Sellercloud has only " + it.sku);
+          if (!r.kind) r.kind = "wrong";
+        } else {
+          let ok = lSame(title, it.name);
+          if (!ok) {
+            const s = skusForTitle(labelsTitle(title));
+            if (s.size) ok = s.has(it.sku);
+            else if (r.labelSku) ok = r.labelSku === it.sku;
+            else if (lOverlap(title, it.name) >= 0.7) ok = true;
+            else {
+              const m = [...(majority.get(labelsTitle(title)) || new Map())].sort((a, b) => b[1] - a[1])[0];
+              ok = !!m && m[0] === it.sku && m[1] >= 2;
+            }
+          }
+          if (!ok) {
+            r.reasons.push(lSpanish(it.name)
+              ? `check product: the label is for "${lShort(title)}" but Sellercloud has ${it.sku} (Temu gave the order name in Spanish, so it could not be compared)`
+              : `wrong product: the label is for "${lShort(title)}" but the Temu order is for "${lShort(it.name)}" (${it.sku})`);
+            if (!r.kind) r.kind = "wrong";
+          }
+          if (it.qty !== labelQty) {
+            r.reasons.push("qty: the label is for " + labelQty + ", Sellercloud has " + it.qty);
+            if (!r.kind) r.kind = "wrong";
+          }
+        }
+      } else other("Sellercloud shows no products on this order");
+    }
+    r.good = r.reasons.length === 0;
+    if (r.good) r.kind = r.shipped ? "shipped" : "good";
+    results.push(r);
+  }
+  if (env.TOKEN_KV) {
+    const fresh = await labelsChecks(env, date);
+    for (const r of results) {
+      const prev = fresh[r.id];
+      const { scId, carrier, service, ...keep } = r;
+      fresh[r.id] = { ...keep, aside: !!(prev && prev.aside && !r.good) };
+    }
+    await env.TOKEN_KV.put(LCHK_KEY(date), JSON.stringify(fresh), { expirationTtl: 45 * 86400 }).catch(() => {});
+    if (namesChanged) {
+      const keys = Object.keys(names);
+      if (keys.length > 4000) for (const k of keys.slice(0, keys.length - 4000)) delete names[k];
+      await env.TOKEN_KV.put(LNAMES_KEY, JSON.stringify(names)).catch(() => {});
+    }
+  }
+  return { results, partial, unchecked, found: new Set(all.map((p) => p.batchId + "|" + p.pkg)) };
+}
+// Sets aside (or brings back) checked labels that are not good. Returns how many changed.
+async function labelsAside(env, date, items, aside) {
+  const fresh = await labelsChecks(env, date);
+  let changed = 0;
+  for (const x of items) {
+    const id = x.batchId + "|" + x.pkg;
+    const c = fresh[id];
+    if (!c || c.good) continue;
+    if (!!c.aside !== aside) { c.aside = aside; c.asideAt = new Date().toISOString(); changed++; }
+  }
+  if (changed && env.TOKEN_KV) await env.TOKEN_KV.put(LCHK_KEY(date), JSON.stringify(fresh), { expirationTtl: 45 * 86400 });
+  return changed;
+}
+
 // ── Labels auto mark shipped (Nov 25, Shragy's ask): when the Hub marks a Temu label printed, mark that order shipped in
 // Sellercloud with the label's carrier, service and tracking. SWITCHED OFF until turned on (KV labels:autoship, on:false).
 // Uses the shared scMarkShipped helper (see Temu backlog). Only orders that are ALL of: Temu company (372), Unshipped,
@@ -5556,51 +5782,29 @@ async function autoshipEnqueue(env, items, by) {
   await env.TOKEN_KV.put(AUTOSHIP_QUEUE, JSON.stringify(q.slice(-5000)));
 }
 const autoshipCarrier = (c) => (/^ups$/i.test(c) ? "UPS" : /^usps$/i.test(c) ? "USPS" : /^fedex$/i.test(c) ? "FedEx" : "Other");
-// Lines of one package, grouped exactly as the Hub's packagesOfBatch does: a tracking number is one package ("t:<tracking>"),
-// and a line with no tracking either starts its own package ("i:<idx>") or joins the line before it.
-function autoshipLines(batch, pkg) {
-  const by = new Map(); let cur = null, ct = false;
-  for (const l of [...(batch?.lines || [])].sort((a, c) => a.idx - c.idx)) {
-    const t = autoshipNorm(l.tracking);
-    if (t) { const k = "t:" + t; if (!by.has(k)) by.set(k, []); by.get(k).push(l); cur = k; ct = true; continue; }
-    if (!cur || ct || (l.cost || 0) > 0) { const k = "i:" + l.idx; by.set(k, [l]); cur = k; ct = false; }
-    else by.get(cur).push(l);
-  }
-  return by.get(pkg) || [];
-}
-// Plan for a list of {batchId,pkg}: one entry per Temu order with its label, and the Sellercloud order checks.
+const autoshipLines = (batch, pkg) => labelsPackages(batch).get(pkg) || [];
+// Plan for a list of {batchId,pkg}: the labels check decides; only good, not yet shipped labels get shipped.
 async function autoshipPlan(env, pkgs) {
-  const days = new Map();
   const out = [];
+  const byDate = new Map();
   for (const p of pkgs) {
     const date = String(p.batchId || "").slice(0, 10);
     if (!isDay(date)) { out.push({ ...p, skip: "batch has no date" }); continue; }
-    if (!days.has(date)) days.set(date, await labelsCall(env, "/day", { date }));
-    const batch = (days.get(date).batches || []).find((b) => b.batchId === p.batchId);
-    const ls = autoshipLines(batch, p.pkg);
-    const orders = [...new Set(ls.map((l) => String(l.orderId || "").trim()).filter(Boolean))];
-    const tr = [...new Set(ls.map((l) => String(l.tracking || "").trim()).filter(Boolean))];
-    if (!ls.length) out.push({ ...p, skip: "label not found in the day's file" });
-    else if (orders.length !== 1) out.push({ ...p, skip: orders.length ? "one label for several orders" : "no Temu order number on the label" });
-    else if (tr.length !== 1) out.push({ ...p, po: orders[0], skip: "no single tracking number on the label" });
-    else out.push({ ...p, po: orders[0], tracking: tr[0], carrier: autoshipCarrier(ls[0].carrier || batch.carrier), service: String(ls[0].service || "").slice(0, 60) });
+    if (!byDate.has(date)) byDate.set(date, []);
+    byDate.get(date).push(p);
   }
-  const want = out.filter((x) => !x.skip);
-  const sc = new Map();
-  for (let i = 0; i < want.length; i += 25) {
-    const ids = [...new Set(want.slice(i, i + 25).map((x) => x.po))];
-    const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids });
-    for (const o of data.Items || []) sc.set(String(o.OrderSourceOrderID), o);
-  }
-  for (const x of want) {
-    const o = sc.get(x.po);
-    if (!o) { x.skip = "Temu order not found in Sellercloud"; continue; }
-    x.scId = o.ID; x.items = (o.Items || o.OrderItems || []).map((i) => (i.ProductID || i.SKU || "") + " x" + (i.Qty ?? i.Quantity ?? "")).join(" + ");
-    const have = [o.TrackingNumber, ...(o.AllTrackingNumbers || [])].map(autoshipNorm).filter(Boolean);
-    if (Number(o.CompanyID) !== TEMUSHIP_COMPANY) x.skip = "not a Temu order (company " + o.CompanyID + ")";
-    else if (!temuUnshipped(o.ShippingStatus)) x.skip = "already not Unshipped in Sellercloud (" + o.ShippingStatus + ")";
-    else if (!temuProcessing(o.StatusCode)) x.skip = "order status is " + o.StatusCode + ", not Processing";
-    else if (have.some((h) => h !== autoshipNorm(x.tracking))) x.skip = "Sellercloud already has another tracking number";
+  for (const [date, list] of byDate) {
+    const { results, unchecked, found } = await labelsCheckRun(env, date, { want: list });
+    const got = new Map(results.map((r) => [r.id, r]));
+    const later = new Set(unchecked);
+    for (const p of list) {
+      const id = p.batchId + "|" + p.pkg;
+      const r = got.get(id);
+      if (!r) { out.push(later.has(id) ? { ...p, skip: "not checked yet", retry: true } : { ...p, skip: found.has(id) ? "not checked" : "label not found in the day's file" }); continue; }
+      if (r.shipped) { out.push({ ...p, po: r.po, skip: "already shipped in Sellercloud with this label" }); continue; }
+      if (!r.good) { out.push({ ...p, po: r.po, skip: "check: " + r.reasons.join("; ") }); continue; }
+      out.push({ ...p, po: r.po, tracking: r.tracking, carrier: r.carrier, service: r.service, scId: r.scId, items: r.items.map((i) => i.sku + " x" + i.qty).join(" + ") });
+    }
   }
   return out;
 }
@@ -5622,7 +5826,10 @@ async function autoshipTick(env) {
   const take = q.slice(0, AUTOSHIP_TICK_MAX);
   await env.TOKEN_KV.put(AUTOSHIP_QUEUE, JSON.stringify(q.slice(take.length)));
   const plan = await autoshipPlan(env, take);
+  const again = plan.filter((x) => x.retry).map(({ batchId, pkg, at, by }) => ({ batchId, pkg, at, by }));
+  if (again.length) { const q2 = (await env.TOKEN_KV.get(AUTOSHIP_QUEUE, "json")) || []; await env.TOKEN_KV.put(AUTOSHIP_QUEUE, JSON.stringify([...q2, ...again].slice(-5000))); }
   for (const x of plan) {
+    if (x.retry) continue;
     if (x.skip) { st.skipped = [...(st.skipped || []), { po: x.po || null, pkg: x.pkg, why: x.skip, at: new Date().toISOString() }].slice(-500); continue; }
     const r = await autoshipShip(env, x).catch((e) => ({ ...x, ok: false, said: String(e.message || e).slice(0, 200) }));
     if (r.ok) st.shipped = (st.shipped || 0) + 1;
@@ -5664,7 +5871,19 @@ async function autoshipRoute(env, url) {
     await autoshipSave(env, st);
     return Response.json({ result: r });
   }
-  return Response.json({ error: "api must be status, preview, ship1, on or off" }, { status: 400 });
+  if (api === "check") {
+    // Read only: run the labels check for a day (optionally one batch, optionally only labels not checked yet).
+    const date = (url.searchParams.get("date") || "").trim();
+    if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
+    const r = await labelsCheckRun(env, date, { batchId: url.searchParams.get("batch") || "", onlyNew: url.searchParams.get("new") === "1" });
+    const stored = await labelsChecks(env, date);
+    const vals = Object.values(stored);
+    const count = (f) => vals.filter(f).length;
+    return Response.json({ ran: r.results.length, partial: r.partial, unchecked: r.unchecked.length,
+      stored: { total: vals.length, good: count((x) => x.good), notGood: count((x) => !x.good), wrong: count((x) => x.kind === "wrong"), mixed: count((x) => x.kind === "mixed"), other: count((x) => x.kind === "other"), shipped: count((x) => x.shipped) },
+      bad: url.searchParams.get("list") === "1" ? vals.filter((x) => !x.good).map((x) => [x.id, x.po, x.kind, x.reasons.join(" / ").slice(0, 160), x.items.map((i) => i.sku + " x" + i.qty).join(" + ")]) : undefined });
+  }
+  return Response.json({ error: "api must be status, preview, ship1, check, on or off" }, { status: 400 });
 }
 
 // ── Temu backlog: mark old unshipped Temu orders shipped in Sellercloud (Nov 25, Shragy's ask) ──
