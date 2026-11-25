@@ -31,3 +31,9 @@ class_name = "LabelStore"
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["LabelStore"]
+
+# Temporary (Nov 25): holds the label check's results so they can be read back. Removed after the check.
+[[d1_databases]]
+binding = "DIAG_DB"
+database_name = "labels-check-tmp"
+database_id = "752b8193-d884-4253-95e9-b11e9ef2459a"

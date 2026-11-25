@@ -3710,7 +3710,7 @@ async function handle(request, env) {
       return json({ error: e.message || String(e), ...(e.busy ? { busy: true, retryAt: e.retryAt || null } : {}) }, st);
     }
   }
-  if (p0 === "/labels-diag") return labelsDiag(env, url);
+  if (p0 === "/labels-diag") return labelsDiag(env, url, request);
   if (p0 === "/labels/dl") {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Only GET is allowed here.", { status: 405 });
     return labelsDirect(request, env, url);
@@ -4607,9 +4607,16 @@ async function labelsPdf(env, request, batchId, filename, cors) {
 // FBM printing page matching. Gated by a one-time token (only its SHA-256 is here). Shows no addresses. Remove after.
 const DIAG_HASH = "4d748e1f01b8273e3526baff2edaea933b18e0d74b611df654921598c3dc0193";
 // TEMPORARY (Nov 25): read-only Sellercloud order check for today's labels. Same token gate as labelsDiag. Remove when done.
-async function labelsDiagSc(env, url) {
+async function labelsDiagSc(env, url, request) {
   deadline = Date.now() + 25_000;
   const api = url.searchParams.get("api") || "";
+  if (api === "save") {
+    if (!env.DIAG_DB || !request || request.method !== "POST") return Response.json({ error: "no db" }, { status: 400 });
+    const k = (url.searchParams.get("k") || "page").slice(0, 40);
+    const v = await request.text();
+    await env.DIAG_DB.prepare("INSERT OR REPLACE INTO diag (k, v, at) VALUES (?, ?, ?)").bind(k, v, new Date().toISOString()).run();
+    return Response.json({ saved: v.length });
+  }
   const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("date") || "") ? url.searchParams.get("date") : new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10);
   const pick = (o) => {
     const a = o.ShippingAddress || {};
@@ -4660,17 +4667,17 @@ if(j.keys)keys=j.keys;rows.push(...j.rows);o.textContent='orders '+rows.length+'
 const src={};rows.forEach(r=>{const s=r.split('|')[4];src[s]=(src[s]||0)+1;});const ch=Object.entries(src).sort((a,b)=>b[1]-a[1])[0]?.[0]||'';
 const F=q.get('from')||'';const idset=new Set(ids);const un=[];let total=0;for(let p=1;p<=250;p++){const j=await get('api=unshipped&short=1&page='+p+(ch?'&channel='+ch:'')+(F?'&from='+F:''));total=j.total;un.push(...j.rows);o.textContent='unshipped '+un.length+'/'+total;if(!j.rows.length||un.length>=total)break;}
 const nolab={};const nolabList=[];for(const r of un){const [id,t]=r.split('|');if(idset.has(id))continue;const d=t.slice(0,10);nolab[d]=(nolab[d]||0)+1;if(t>=(q.get('since')||'9'))nolabList.push(r);}const un2=['NOLABEL_BY_DAY '+JSON.stringify(nolab),'UNSHIPPED_SEEN '+un.length,...nolabList];
-o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.slice(0,20).join(' / '),'BAD '+bad.join(','),'== ORDERS',...rows,'== UNSHIPPED',...un2,'== LINES',...lines,'== END'].join('\\n');}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
+o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.slice(0,20).join(' / '),'BAD '+bad.join(','),'== ORDERS',...rows,'== UNSHIPPED',...un2,'== LINES',...lines,'== END'].join('\\n');try{const sv=await fetch('/labels-diag?t='+encodeURIComponent(T)+'&api=save&k='+encodeURIComponent(q.get('k')||'page'),{method:'POST',body:o.textContent});o.textContent='SAVED '+(await sv.text())+'\\n'+o.textContent;}catch(e){o.textContent='SAVEFAIL '+e.message+'\\n'+o.textContent;}}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
 <\/script>`;
     return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
   }
   return new Response("Not found.", { status: 404 });
 }
-async function labelsDiag(env, url) {
+async function labelsDiag(env, url, request) {
   const t = (url.searchParams.get("t") || "").trim();
   const h = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map((b) => b.toString(16).padStart(2, "0")).join("");
   if (!t || !safeEqual(h, DIAG_HASH)) return new Response("Not found.", { status: 404 });
-  if (url.searchParams.get("api")) return labelsDiagSc(env, url);
+  if (url.searchParams.get("api")) return labelsDiagSc(env, url, request);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("date") || "") ? url.searchParams.get("date") : new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10);
   const day = await labelsCall(env, "/day", { date });
   const secret = labelsLinkSecret(env);
@@ -4892,8 +4899,8 @@ async function labelsAddScSkus(env, day, date) {
     const ids = [...picks].slice(0, 300);
     const orders = [];
     const stopAt = Date.now() + 12_000;
-    for (let i = 0; i < ids.length && Date.now() < stopAt; i += 50) {
-      const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 50, orderSourceOrderIDList: ids.slice(i, i + 50) });
+    for (let i = 0; i < ids.length && Date.now() < stopAt; i += 25) {
+      const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids.slice(i, i + 25) });
       orders.push(...(data?.Items || []));
     }
     // Two passes: single-product orders first, then mixed orders by elimination or matching name.
