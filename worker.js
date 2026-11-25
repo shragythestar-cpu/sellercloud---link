@@ -6026,12 +6026,14 @@ async function temuShipSome(env, st, max, stopAt) {
   const labelPos = await temuLabelPos(env);
   const labelMap = labelMode ? await temuLabelMap(env) : null;
   const poOf = (o) => String(o.OrderSourceOrderID || "").trim();
-  let page = 1;
+  // The label pass starts a page before where the old orders began last time (the newest orders sit on top).
+  let page = labelMode ? Math.max(1, (st.labelStart || 1) - 1) : 1;
   while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
     // The label pass reads newest first in big pages: labelled orders are recent, the oldest are Freight ones.
     const { total, items } = await temuListPage(env, st.cutoff, page, labelMode ? 250 : 50, labelMode);
-    if (page === 1) res.left = total;
+    if (res.left === null) res.left = total;
     if (!items.length) { res.reachedEnd = true; break; }
+    if (labelMode && !res.firstOldPage && items.some((o) => temuEligible(o, st.cutoff))) res.firstOldPage = page;
     const want = labelMode
       ? items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && labelMap.get(poOf(o))?.tracking)
       : items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(poOf(o)));
@@ -6068,6 +6070,7 @@ function temuMerge(st, res) {
   st.lastTick = new Date().toISOString(); st.lastLeft = res.left; st.lastSeen = res.seen; st.lastHasLabel = res.hasLabel || 0;
   if (st.limit && st.shipped >= st.limit) { st.on = false; st.stopped = "limit reached"; }
   if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen && (st.mode !== "label" || res.reachedEnd))) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
+  if (st.mode === "label" && res.firstOldPage) st.labelStart = res.firstOldPage;
   if (st.mode === "label") { st.labelShipped = (st.labelShipped || 0) + res.shipped; st.lastLabelBad = res.labelBad || 0; }
   // Freight pass done: go on to the orders with a label, with their own tracking (when started with &then=label).
   if (!st.on && st.mode !== "label" && st.then === "label" && st.stopped === "no more orders before the cutoff") {
@@ -6161,7 +6164,7 @@ o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby mont
     if (st.on) return Response.json({ error: "The background run is on; stop it first." }, { status: 409 });
     st.cutoff = cutoff;
     const keep = st.mode || null;
-    if (url.searchParams.get("mode") === "label") st.mode = "label";
+    if (url.searchParams.get("mode") === "label") { st.mode = "label"; if (url.searchParams.get("page")) st.labelStart = parseInt(url.searchParams.get("page"), 10) || st.labelStart; }
     const res = await temuShipSome(env, st, n, Date.now() + 20_000);
     temuMerge(st, res); st.on = false; st.mode = keep; await temuSave(env, st);
     return Response.json({ res, state: st });
