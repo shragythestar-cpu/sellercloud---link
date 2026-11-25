@@ -5993,29 +5993,58 @@ async function temuLabelPos(env) {
   if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, JSON.stringify({ at: Date.now(), pos: [...pos] }), { expirationTtl: 3600 }).catch(() => {});
   return pos;
 }
+// Temu order -> its label's tracking, from the same 30 days of label files. Only an order with exactly one
+// tracking number across its labels gets one; anything else is left alone ("bad").
+async function temuLabelMap(env) {
+  const ck = "temuship:labelmap";
+  const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck, "json").catch(() => null) : null;
+  if (hit && Date.now() - hit.at < 10 * 60_000) return new Map(Object.entries(hit.map));
+  const acc = new Map();
+  for (let d = 0; d < 30; d++) {
+    const date = new Date(Date.now() - d * 86400_000).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const day = await labelsCall(env, "/day", { date });
+    for (const b of day.batches || []) for (const l of b.lines || []) {
+      const po = String(l.orderId || "").trim(); if (!po) continue;
+      const a = acc.get(po) || { tr: new Set(), carrier: "", service: "" };
+      const t = String(l.tracking || "").trim();
+      if (t) { a.tr.add(t); a.carrier = a.carrier || autoshipCarrier(l.carrier || b.carrier); a.service = a.service || String(l.service || "").slice(0, 60); }
+      acc.set(po, a);
+    }
+  }
+  const map = {};
+  for (const [po, a] of acc) map[po] = a.tr.size === 1 ? { tracking: [...a.tr][0], carrier: a.carrier || "Other", service: a.service || a.carrier || "Other" } : { bad: a.tr.size ? "several tracking numbers" : "no tracking on the label" };
+  if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, JSON.stringify({ at: Date.now(), map }), { expirationTtl: 3600 }).catch(() => {});
+  return new Map(Object.entries(map));
+}
 async function temuShipSome(env, st, max, stopAt) {
   const res = { shipped: 0, failed: [], skipped: 0, seen: 0, left: null, hasLabel: 0 };
+  const labelMode = st.mode === "label";
   const labelPos = await temuLabelPos(env);
+  const labelMap = labelMode ? await temuLabelMap(env) : null;
+  const poOf = (o) => String(o.OrderSourceOrderID || "").trim();
   let page = 1;
   while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
     const { total, items } = await temuListPage(env, st.cutoff, page);
     if (page === 1) res.left = total;
     if (!items.length) break;
-    const want = items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(String(o.OrderSourceOrderID || "").trim()));
-    res.hasLabel += items.filter((o) => temuEligible(o, st.cutoff) && labelPos.has(String(o.OrderSourceOrderID || "").trim())).length;
+    const want = labelMode
+      ? items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && labelMap.get(poOf(o))?.tracking)
+      : items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(poOf(o)));
+    res.hasLabel += items.filter((o) => temuEligible(o, st.cutoff) && labelPos.has(poOf(o))).length;
+    if (labelMode) res.labelBad = (res.labelBad || 0) + items.filter((o) => temuEligible(o, st.cutoff) && labelMap.get(poOf(o))?.bad).length;
     res.skipped += items.length - want.length; res.seen += items.length;
     if (!want.length) { page++; if (page > 60) break; continue; }
     for (let i = 0; i < want.length && res.shipped + res.failed.length < max && Date.now() < stopAt; i += 25) {
       const part = want.slice(i, Math.min(i + 25, i + (max - res.shipped - res.failed.length)));
       const out = [];
       for (let j = 0; j < part.length; j += 3) {
-        out.push(...await Promise.all(part.slice(j, j + 3).map(async (o) => ({ o, r: await scMarkShipped(env, o.ID).catch((e) => ({ ok: false, said: e.message })) }))));
+        out.push(...await Promise.all(part.slice(j, j + 3).map(async (o) => ({ o, r: await scMarkShipped(env, o.ID, labelMode ? labelMap.get(poOf(o)) : undefined).catch((e) => ({ ok: false, said: e.message })) }))));
         if (Date.now() > stopAt) break;
       }
       const fresh = await temuFresh(env, out.map((x) => x.o.OrderSourceOrderID)).catch(() => ({}));
       for (const { o, r } of out) {
         const f = fresh[o.ID];
-        if (r.ok && f && !temuUnshipped(f.ShippingStatus)) res.shipped++;
+        if (r.ok && f && !temuUnshipped(f.ShippingStatus)) { res.shipped++; if (labelMode) res.withTracking = (res.withTracking || 0) + 1; }
         else if (r.busy) { /* not tried; next tick picks it up */ }
         else res.failed.push({ id: o.ID, po: o.OrderSourceOrderID, status: r.status || null, said: (r.said || "").slice(0, 160), after: f ? f.ShippingStatus : null });
       }
@@ -6034,6 +6063,12 @@ function temuMerge(st, res) {
   st.lastTick = new Date().toISOString(); st.lastLeft = res.left; st.lastSeen = res.seen; st.lastHasLabel = res.hasLabel || 0;
   if (st.limit && st.shipped >= st.limit) { st.on = false; st.stopped = "limit reached"; }
   if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen)) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
+  if (st.mode === "label") { st.labelShipped = (st.labelShipped || 0) + res.shipped; st.lastLabelBad = res.labelBad || 0; }
+  // Freight pass done: go on to the orders with a label, with their own tracking (when started with &then=label).
+  if (!st.on && st.mode !== "label" && st.then === "label" && st.stopped === "no more orders before the cutoff") {
+    st.freightDone = { shipped: st.shipped, at: new Date().toISOString() };
+    st.mode = "label"; st.then = null; st.limit = 0; st.on = true; st.stopped = null; st.failedIds = [];
+  }
   return st;
 }
 async function temuBacklogTick(env) {
@@ -6128,6 +6163,8 @@ o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby mont
     const st = (await temuState(env)) || { shipped: 0, failed: [], failedIds: [] };
     st.cutoff = cutoff; st.on = true; st.stopped = null; st.startedAt = st.startedAt || new Date().toISOString();
     st.limit = parseInt(url.searchParams.get("limit") || "0", 10) || 0;
+    if (url.searchParams.has("then")) st.then = url.searchParams.get("then") === "label" ? "label" : null;
+    if (url.searchParams.has("mode")) st.mode = url.searchParams.get("mode") === "label" ? "label" : null;
     await temuSave(env, st);
     return Response.json(st);
   }
