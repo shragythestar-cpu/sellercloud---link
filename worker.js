@@ -4627,6 +4627,11 @@ async function labelsDiagSc(env, url, request) {
     return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), String(o.TimeOfOrder || "").slice(0, 16), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
   };
   if (api === "photo") return Response.json(await labelsPhoto(env, (url.searchParams.get("sku") || "").trim()));
+  if (api === "oimg") {
+    const ids = (url.searchParams.get("ids") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 25);
+    const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids });
+    return Response.json((data.Items || []).map((o) => ({ id: o.OrderSourceOrderID, items: (o.Items || []).map((i) => ({ sku: i.ProductID, img: i.ImageURL, name: (i.DisplayName || "").slice(0, 60) })) })));
+  }
   if (api === "cat") {
     const id = (url.searchParams.get("sku") || "").trim();
     const data = await scGet(env, "/catalog", { SKU: [id], pageNumber: 1, pageSize: 5 });
