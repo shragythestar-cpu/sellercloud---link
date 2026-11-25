@@ -3709,6 +3709,7 @@ async function handle(request, env) {
       return json({ error: e.message || String(e), ...(e.busy ? { busy: true, retryAt: e.retryAt || null } : {}) }, st);
     }
   }
+  if (p0 === "/labels-diag") return labelsDiag(env, url);
   if (p0 === "/labels/dl") {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Only GET is allowed here.", { status: 405 });
     return labelsDirect(request, env, url);
@@ -4600,6 +4601,60 @@ async function labelsPdf(env, request, batchId, filename, cors) {
   const headers = { ...base, ...(size ? { "content-length": String(size) } : {}) };
   if (request.method === "HEAD") { try { await got.value.cancel(); } catch {} return new Response(null, { headers }); }
   return new Response(got.value, { headers });
+}
+// TEMPORARY (Nov 25): read-only check of how today's label PDFs line up with their uploaded lines, for fixing the
+// FBM printing page matching. Gated by a one-time token (only its SHA-256 is here). Shows no addresses. Remove after.
+const DIAG_HASH = "4d748e1f01b8273e3526baff2edaea933b18e0d74b611df654921598c3dc0193";
+async function labelsDiag(env, url) {
+  const t = (url.searchParams.get("t") || "").trim();
+  const h = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (!t || !safeEqual(h, DIAG_HASH)) return new Response("Not found.", { status: 404 });
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("date") || "") ? url.searchParams.get("date") : new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10);
+  const day = await labelsCall(env, "/day", { date });
+  const secret = labelsLinkSecret(env);
+  const exp = Math.floor(Date.now() / 1000) + 15 * 60;
+  const batches = [];
+  for (const b of day.batches || []) {
+    const sig = await labelsSign(secret, b.batchId, exp);
+    const link = new URL("/labels/dl", url.origin);
+    link.searchParams.set("batchId", b.batchId); link.searchParams.set("exp", String(exp)); link.searchParams.set("sig", sig);
+    batches.push({ ...b, dl: link.toString() });
+  }
+  const data = JSON.stringify({ date, batches, printed: (day.printed || []).length }).replace(/</g, "\\u003c");
+  const html = `<!doctype html><meta charset="utf-8"><title>diag</title><pre id="out">working…</pre>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>
+const D=${data};
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+const norm=x=>String(x||'').toUpperCase().replace(/[^A-Z0-9]/g,'');
+const PRE=/^(temu|eaw\\s*fbm|eaw\\s*fba|eaw|fbm|fba|walmart|wfs|woot)(?=[\\s\\-_:.]|$)[\\s\\-_:.]*/;
+const sk=s=>{let v=String(s||'').toLowerCase().trim();v=v.replace(PRE,'');v=v.replace(PRE,'');return v.replace(/[^a-z0-9]/g,'');};
+function pk(b){const by=new Map(),order=[];let cur=null,ct=false;for(const l of [...b.lines].sort((a,c)=>a.idx-c.idx)){const t=norm(l.tracking);if(t){const k='t:'+t;if(!by.has(k)){by.set(k,[]);order.push(k);}by.get(k).push(l);cur=k;ct=true;continue;}if(!cur||ct||(l.cost||0)>0){const k='i:'+l.idx;by.set(k,[l]);order.push(k);cur=k;ct=false;}else by.get(cur).push(l);}return order.map(k=>{const ls=by.get(k);return{key:k,ls,mixed:new Set(ls.map(l=>sk(l.sku))).size>1,tr:ls.find(l=>l.tracking)?.tracking||'',oid:ls.find(l=>l.orderId)?.orderId||'',page:ls.find(l=>l.page>0)?.page||null}});}
+const mask=s=>s.replace(/[a-z]/g,'x').replace(/[A-Z]/g,'X');
+(async()=>{const out=[];for(const b of D.batches){const r={batchId:b.batchId,platform:b.platform,carrier:b.carrier,lines:b.lines.length};
+const L=b.lines;r.lineStats={tracking:L.filter(l=>norm(l.tracking)).length,page:L.filter(l=>l.page>0).length,orderId:L.filter(l=>l.orderId).length,costPos:L.filter(l=>(l.cost||0)>0).length,costNull:L.filter(l=>l.cost==null).length,distinctOrder:new Set(L.map(l=>l.orderId)).size,distinctTracking:new Set(L.map(l=>norm(l.tracking))).size,distinctSku:new Set(L.map(l=>l.sku)).size,pageMax:Math.max(0,...L.map(l=>l.page||0))};
+r.sample=L.slice(0,6).map(l=>({idx:l.idx,sku:l.sku,qty:l.qty,tr:l.tracking,oid:l.orderId,page:l.page,cost:l.cost,carrier:l.carrier}));
+const P=pk(b);r.packages=P.length;r.mixed=P.filter(p=>p.mixed).length;r.mixedSample=P.filter(p=>p.mixed).slice(0,3).map(p=>p.ls.map(l=>({idx:l.idx,sku:l.sku,qty:l.qty,tr:l.tracking,oid:l.orderId,cost:l.cost,page:l.page})));
+// same orderId across packages?
+const byOid=new Map();for(const p of P){byOid.set(p.oid,(byOid.get(p.oid)||0)+1);}r.oidInManyPackages=[...byOid.values()].filter(n=>n>1).length;
+try{const buf=await (await fetch(b.dl)).arrayBuffer();const doc=await pdfjsLib.getDocument({data:new Uint8Array(buf)}).promise;r.pages=doc.numPages;const vp=(await doc.getPage(1)).getViewport({scale:1});r.size=[vp.width,vp.height];
+const raw=[];for(let i=1;i<=doc.numPages;i++){const tc=await (await doc.getPage(i)).getTextContent();raw.push(tc.items.map(x=>x.str||'').join(' '));}
+const tx=raw.map(norm);r.pagesWithText=tx.filter(t=>t.length>20).length;r.textLen=[tx[0]?.length,tx[1]?.length,tx[2]?.length];
+r.page1=mask(raw[0]||'').slice(0,700);r.page2=mask(raw[1]||'').slice(0,700);
+// raw digits-only tokens on page 1 (structure)
+r.page1Numbers=(raw[0]||'').match(/[A-Z0-9-]{8,}/g)?.slice(0,25);
+const cnt=(needle)=>{if(!needle)return -1;let n=0;for(const t of tx)if(t.includes(needle))n++;return n;};
+const st={trUnique:0,trMulti:0,trNone:0,trEmpty:0,oidUnique:0,oidMulti:0,oidNone:0,oidDigitsUnique:0,oidDigitsMulti:0,trTail12Unique:0};
+for(const p of P){const t=norm(p.tr);const c=cnt(t);if(c<0)st.trEmpty++;else if(c===1)st.trUnique++;else if(c>1)st.trMulti++;else st.trNone++;
+const o=norm(p.oid);const co=cnt(o.length>=6?o:'');if(co===1)st.oidUnique++;else if(co>1)st.oidMulti++;else if(co===0)st.oidNone++;
+const od=o.replace(/^PO211/,'');const cd=cnt(od.length>=8?od:'');if(cd===1)st.oidDigitsUnique++;else if(cd>1)st.oidDigitsMulti++;
+if(t.length>=12&&cnt(t.slice(-12))===1)st.trTail12Unique++;}
+r.match=st;r.missSample=P.slice(0,4).map(p=>({tr:p.tr,oid:p.oid,trHits:cnt(norm(p.tr)),oidHits:cnt(norm(p.oid))}));
+}catch(e){r.pdfError=String(e&&e.message||e);}
+out.push(r);document.getElementById('out').textContent=JSON.stringify(out,null,1);}
+document.getElementById('out').textContent=JSON.stringify({date:D.date,printed:D.printed,batches:out},null,1);document.title='diag done';})();
+</script>`;
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 async function labelsDirect(request, env, url) {
   const gone = () => new Response("This download link has expired. Open it again from the Hub.", { status: 403, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
