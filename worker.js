@@ -5534,7 +5534,9 @@ async function scMarkShipped(env, orderId, o = {}) {
   }
   return { ok: false, status: 409, said: "too many requests", busy: true };
 }
-const temuNyDay = (t) => { try { return new Date(t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }); } catch { return ""; } };
+// Sellercloud's REST times come without an offset and are already New York time (checked Nov 25 against the web
+// grid, which shows the same clock time with -04:00/-05:00), so the day is the first 10 characters.
+const temuNyDay = (t) => { const s = String(t || ""); if (!/(Z|[+-]\d\d:?\d\d)$/.test(s)) return s.slice(0, 10); try { return new Date(s).toLocaleDateString("en-CA", { timeZone: "America/New_York" }); } catch { return ""; } };
 const temuUnshipped = (v) => v === 1 || /^unshipped$/i.test(String(v));
 const temuProcessing = (v) => v === 2 || /^(processing|inprocess)$/i.test(String(v));
 function temuEligible(o, cutoff) {
@@ -5543,9 +5545,10 @@ function temuEligible(o, cutoff) {
 }
 // One page of unshipped Temu orders created before the cutoff (midnight New York of the cutoff day, +1 day slack;
 // the TimeOfOrder check above decides).
+let temuExtra = {};
 async function temuListPage(env, cutoff, page, pageSize = 50) {
   const to = new Date(Date.parse(cutoff + "T00:00:00-05:00") + 86400e3).toISOString();
-  const data = await scGet(env, "/Orders", { pageNumber: page, pageSize, shippingStatus: "Unshipped", companyID: TEMUSHIP_COMPANY, createdOnTo: to });
+  const data = await scGet(env, "/Orders", { pageNumber: page, pageSize, shippingStatus: "Unshipped", companyID: TEMUSHIP_COMPANY, createdOnTo: to, ...temuExtra });
   return { total: data.TotalResults, items: data.Items || [] };
 }
 async function temuFresh(env, poIds) {
@@ -5612,12 +5615,14 @@ async function temuBacklogRoute(env, url) {
   if (!t || !safeEqual(h, TEMUSHIP_HASH)) return new Response("Not found.", { status: 404 });
   deadline = Date.now() + 25_000;
   const api = url.searchParams.get("api") || "status";
+  temuExtra = {};
+  if (api === "keys" || api === "dry") for (const [k, v] of url.searchParams) if (k.startsWith("p_")) temuExtra[k.slice(2)] = v;
   const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("cutoff") || "") ? url.searchParams.get("cutoff") : "2026-11-23";
   if (api === "status") return Response.json(await temuState(env));
   if (api === "keys") {
     const { total, items } = await temuListPage(env, cutoff, 1, 3);
     const o = items[0] || {};
-    return Response.json({ total, keys: Object.keys(o), sample: items.map((x) => ({ ID: x.ID, CompanyID: x.CompanyID, OrderSource: x.OrderSource, ShippingStatus: x.ShippingStatus, StatusCode: x.StatusCode, TimeOfOrder: x.TimeOfOrder, CreatedOn: x.CreatedOn, Picked: x.Picked ?? x.PickedStatus ?? x.IsPicked ?? null, po: x.OrderSourceOrderID })) });
+    return Response.json({ total, keys: Object.keys(o), itemKeys: Object.keys((o.Items || [])[0] || {}), item0: (o.Items || [])[0] || null, sample: items.map((x) => ({ ID: x.ID, CompanyID: x.CompanyID, OrderSource: x.OrderSource, ShippingStatus: x.ShippingStatus, StatusCode: x.StatusCode, TimeOfOrder: x.TimeOfOrder, CreatedOn: x.CreatedOn, Picked: x.Picked ?? x.PickedStatus ?? x.IsPicked ?? null, po: x.OrderSourceOrderID })) });
   }
   if (api === "dry") {
     const page = parseInt(url.searchParams.get("page") || "1", 10) || 1;
