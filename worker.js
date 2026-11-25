@@ -4605,10 +4605,43 @@ async function labelsPdf(env, request, batchId, filename, cors) {
 // TEMPORARY (Nov 25): read-only check of how today's label PDFs line up with their uploaded lines, for fixing the
 // FBM printing page matching. Gated by a one-time token (only its SHA-256 is here). Shows no addresses. Remove after.
 const DIAG_HASH = "4d748e1f01b8273e3526baff2edaea933b18e0d74b611df654921598c3dc0193";
+// TEMPORARY (Nov 25): read-only Sellercloud order check for today's labels. Same token gate as labelsDiag. Remove when done.
+async function labelsDiagSc(env, url) {
+  deadline = Date.now() + 25_000;
+  const api = url.searchParams.get("api") || "";
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("date") || "") ? url.searchParams.get("date") : new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10);
+  const pick = (o) => {
+    const a = o.ShippingAddress || {};
+    const items = (o.Items || o.OrderItems || []).map((i) => [i.ProductID || i.ProductIDOriginal || i.SKU || "", i.Qty ?? i.Quantity ?? "", i.QtyShipped ?? ""].join(":"));
+    return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), ((a.FirstName || "") + " " + (a.LastName || "")).trim(), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
+  };
+  if (api === "ids") {
+    const day = await labelsCall(env, "/day", { date });
+    const ids = new Set();
+    for (const b of day.batches || []) for (const l of b.lines || []) if (l.orderId) ids.add(String(l.orderId).trim());
+    return Response.json({ ids: [...ids] });
+  }
+  if (api === "orders") {
+    const ids = (url.searchParams.get("ids") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 50);
+    const pfx = url.searchParams.get("pfx") === "1" ? "model." : "";
+    const data = await scGet(env, "/Orders", { [pfx + "pageNumber"]: 1, [pfx + "pageSize"]: 50, [pfx + "orderSourceOrderIDList"]: ids });
+    const items = data.Items || [];
+    return Response.json({ total: data.TotalResults, rows: items.map(pick), keys: url.searchParams.get("keys") === "1" && items[0] ? { order: Object.keys(items[0]), item: Object.keys((items[0].Items || items[0].OrderItems || [])[0] || {}) } : undefined });
+  }
+  if (api === "unshipped") {
+    const params = { pageNumber: parseInt(url.searchParams.get("page") || "1", 10) || 1, pageSize: 50, shippingStatus: "Unshipped" };
+    const ch = url.searchParams.get("channel"); if (ch) params.channel = [ch];
+    const from = url.searchParams.get("from"); if (from) params.createdOnFrom = from;
+    const data = await scGet(env, "/Orders", params);
+    return Response.json({ total: data.TotalResults, rows: (data.Items || []).map(pick) });
+  }
+  return new Response("Not found.", { status: 404 });
+}
 async function labelsDiag(env, url) {
   const t = (url.searchParams.get("t") || "").trim();
   const h = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map((b) => b.toString(16).padStart(2, "0")).join("");
   if (!t || !safeEqual(h, DIAG_HASH)) return new Response("Not found.", { status: 404 });
+  if (url.searchParams.get("api")) return labelsDiagSc(env, url);
   const date = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("date") || "") ? url.searchParams.get("date") : new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10);
   const day = await labelsCall(env, "/day", { date });
   const secret = labelsLinkSecret(env);
