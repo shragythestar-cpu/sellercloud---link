@@ -5796,13 +5796,17 @@ async function autoshipPlan(env, pkgs) {
   for (const [date, list] of byDate) {
     const { results, unchecked, found } = await labelsCheckRun(env, date, { want: list });
     const got = new Map(results.map((r) => [r.id, r]));
+    const stored = await labelsChecks(env, date);
     const later = new Set(unchecked);
     for (const p of list) {
       const id = p.batchId + "|" + p.pkg;
       const r = got.get(id);
       if (!r) { out.push(later.has(id) ? { ...p, skip: "not checked yet", retry: true } : { ...p, skip: found.has(id) ? "not checked" : "label not found in the day's file" }); continue; }
       if (r.shipped) { out.push({ ...p, po: r.po, skip: "already shipped in Sellercloud with this label" }); continue; }
-      if (!r.good) { out.push({ ...p, po: r.po, skip: "check: " + r.reasons.join("; ") }); continue; }
+      // A wrong-product or mixed label that was set aside is printed from Needs fixing with a packing slip built from
+      // Sellercloud, so the box holds what the order holds: that one may ship. Anything else not good does not.
+      const fixed = (r.kind === "wrong" || r.kind === "mixed") && !!stored[id]?.aside;
+      if (!r.good && !fixed) { out.push({ ...p, po: r.po, skip: "check: " + r.reasons.join("; ") }); continue; }
       out.push({ ...p, po: r.po, tracking: r.tracking, carrier: r.carrier, service: r.service, scId: r.scId, items: r.items.map((i) => i.sku + " x" + i.qty).join(" + ") });
     }
   }
