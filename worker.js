@@ -5759,14 +5759,31 @@ async function temuFresh(env, poIds) {
   const m = {}; for (const o of data.Items || []) m[o.ID] = o; return m;
 }
 // Ships up to max eligible orders now; checks each one's status again right after.
+// Temu order IDs that have a label (with tracking) in the LABELS store in the last 30 days, New York days.
+// The backlog run leaves those open, so the label flow can mark them shipped with their real tracking.
+async function temuLabelPos(env) {
+  const ck = "temuship:labelpos";
+  const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck, "json").catch(() => null) : null;
+  if (hit && Date.now() - hit.at < 10 * 60_000) return new Set(hit.pos);
+  const pos = new Set();
+  for (let d = 0; d < 30; d++) {
+    const date = new Date(Date.now() - d * 86400_000).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const day = await labelsCall(env, "/day", { date }); // throws if the store is missing: then nothing ships
+    for (const b of day.batches || []) for (const l of b.lines || []) { const po = String(l.orderId || "").trim(); if (po) pos.add(po); }
+  }
+  if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, JSON.stringify({ at: Date.now(), pos: [...pos] }), { expirationTtl: 3600 }).catch(() => {});
+  return pos;
+}
 async function temuShipSome(env, st, max, stopAt) {
-  const res = { shipped: 0, failed: [], skipped: 0, seen: 0, left: null };
+  const res = { shipped: 0, failed: [], skipped: 0, seen: 0, left: null, hasLabel: 0 };
+  const labelPos = await temuLabelPos(env);
   let page = 1;
   while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
     const { total, items } = await temuListPage(env, st.cutoff, page);
     if (page === 1) res.left = total;
     if (!items.length) break;
-    const want = items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID));
+    const want = items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(String(o.OrderSourceOrderID || "").trim()));
+    res.hasLabel += items.filter((o) => temuEligible(o, st.cutoff) && labelPos.has(String(o.OrderSourceOrderID || "").trim())).length;
     res.skipped += items.length - want.length; res.seen += items.length;
     if (!want.length) { page++; if (page > 60) break; continue; }
     for (let i = 0; i < want.length && res.shipped + res.failed.length < max && Date.now() < stopAt; i += 25) {
@@ -5795,7 +5812,7 @@ function temuMerge(st, res) {
   st.shipped = (st.shipped || 0) + res.shipped;
   st.failed = [...(st.failed || []), ...res.failed].slice(-300);
   st.failedIds = [...new Set([...(st.failedIds || []), ...res.failed.map((f) => f.id)])].slice(-2000);
-  st.lastTick = new Date().toISOString(); st.lastLeft = res.left; st.lastSeen = res.seen;
+  st.lastTick = new Date().toISOString(); st.lastLeft = res.left; st.lastSeen = res.seen; st.lastHasLabel = res.hasLabel || 0;
   if (st.limit && st.shipped >= st.limit) { st.on = false; st.stopped = "limit reached"; }
   if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen)) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
   return st;
@@ -5823,6 +5840,25 @@ async function temuBacklogRoute(env, url) {
   const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("cutoff") || "") ? url.searchParams.get("cutoff") : "2026-11-23";
   if (api === "status") return Response.json(await temuState(env));
   if (api === "newtoken") { await dropToken(env); return Response.json({ ok: true, note: "Sellercloud sign-in dropped; next call signs in fresh" }); }
+  if (api === "overlap") {
+    // Orders with a label in the last 30 days: how they stand in Sellercloud now.
+    const pos = [...(await temuLabelPos(env))];
+    const out = { labelOrders: pos.length, unshipped: 0, shippedWithTracking: 0, shippedNoTracking: [], notFound: 0, other: 0 };
+    for (let i = 0; i < pos.length && Date.now() < deadline - 3000; i += 25) {
+      const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: pos.slice(i, i + 25) });
+      const got = new Map((data.Items || []).map((o) => [String(o.OrderSourceOrderID), o]));
+      for (const po of pos.slice(i, i + 25)) {
+        const o = got.get(po);
+        if (!o) { out.notFound++; continue; }
+        if (Number(o.CompanyID) !== TEMUSHIP_COMPANY) { out.other++; continue; }
+        if (temuUnshipped(o.ShippingStatus)) { out.unshipped++; continue; }
+        const tr = [o.TrackingNumber, ...(o.AllTrackingNumbers || [])].filter((x) => String(x || "").trim());
+        if (tr.length) out.shippedWithTracking++; else out.shippedNoTracking.push({ id: o.ID, po, time: o.TimeOfOrder });
+      }
+      out.checked = Math.min(pos.length, i + 25);
+    }
+    return Response.json(out);
+  }
   if (api === "whoami") return Response.json({ sellercloudUser: env.SC_USERNAME || null });
   if (api === "reset") { const st = (await temuState(env)) || {}; if (st.on) return Response.json({ error: "stop the run first" }, { status: 409 }); st.failed = []; st.failedIds = []; await temuSave(env, st); return Response.json(st); }
   if (api === "keys") {
