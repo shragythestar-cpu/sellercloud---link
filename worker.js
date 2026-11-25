@@ -4649,7 +4649,13 @@ for(const p of P){const t=norm(p.tr);const c=cnt(t);if(c<0)st.trEmpty++;else if(
 const o=norm(p.oid);const co=cnt(o.length>=6?o:'');if(co===1)st.oidUnique++;else if(co>1)st.oidMulti++;else if(co===0)st.oidNone++;
 const od=o.replace(/^PO211/,'');const cd=cnt(od.length>=8?od:'');if(cd===1)st.oidDigitsUnique++;else if(cd>1)st.oidDigitsMulti++;
 if(t.length>=12&&cnt(t.slice(-12))===1)st.trTail12Unique++;}
-r.match=st;r.missSample=P.slice(0,4).map(p=>({tr:p.tr,oid:p.oid,trHits:cnt(norm(p.tr)),oidHits:cnt(norm(p.oid))}));
+r.match=st;r.uploadedAt=b.uploadedAt;
+const pp=P.map(p=>p.page);r.pkgPageNull=pp.filter(x=>!x).length;r.pkgPageOut=pp.filter(x=>x&&(x<1||x>doc.numPages)).length;r.pkgPageDup=pp.length-new Set(pp).size;
+r.pkgPageHasText=P.filter(p=>p.page&&tx[p.page-1]&&tx[p.page-1].length>20).length;
+r.linePageMismatchInPkg=P.filter(p=>new Set(p.ls.map(l=>l.page)).size>1).length;
+const want=['PO21107225837404790163','PO21107050343670393257','PO21112924718656631139'];r.probe=P.filter(p=>want.includes(norm(p.oid))).map(p=>({oid:p.oid,key:p.key,page:p.page,pageText:(tx[p.page-1]||'').length,lines:p.ls.length,mixed:p.mixed}));
+const slipPages=tx.map((t,i)=>t.length>20?i+1:0).filter(Boolean);r.slipPagesFirst=slipPages.slice(0,8);
+r.missSample=P.slice(0,4).map(p=>({tr:p.tr,oid:p.oid,trHits:cnt(norm(p.tr)),oidHits:cnt(norm(p.oid))}));
 }catch(e){r.pdfError=String(e&&e.message||e);}
 out.push(r);document.getElementById('out').textContent=JSON.stringify(out,null,1);}
 document.getElementById('out').textContent=JSON.stringify({date:D.date,printed:D.printed,batches:out},null,1);document.title='diag done';})();
