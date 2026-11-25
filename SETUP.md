@@ -100,3 +100,7 @@ The worker can assemble kits in Sellercloud with the same call Sellercloud's own
   run's 0.1 units ÷ total produced (rounded down), one assembly per part into its own bin, leftover removed once. Every
   card of the run is locked to the main card; Clear only from the main card. Every plan answer carries
   `features: { splitOutputs: true, maxOutputs: 6 }`. Mix kits can't split yet (400).
+- **Bin contents (Nov 25).** `POST /bins/contents` `{ bins: [names] }` (APP_KEY or ASSEMBLE_KEY, up to 25) answers
+  `{ warehouseId, bins: [{ bin, exists, totalQty, skus: [{ sku, qty }] }] }` for Skustack Warehouse only. Read-only
+  (WarehouseBin_ListAll and ProductWarehouseBin_All_ByBinName); each bin is kept 60 s. `debug: true` adds the reply's
+  field names per bin, uncached.

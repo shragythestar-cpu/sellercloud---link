@@ -67,6 +67,8 @@
 //   time (bin list 10 min, catalog and kit parts 1 min, stock and bin qty 15 s); add &fresh=1 to read Sellercloud now.
 //   POST /assemble {sku,qty,itemId,fromBin,toBin[,source,perKit]}  (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes)
 //   /assemble/kit?sku=SKU          (ASSEMBLE_KEY) a product's kit parts and qty per kit (read-only)
+//   POST /bins/contents {bins:[names]} (APP_KEY or ASSEMBLE_KEY; Nov 25) READ-ONLY: each bin of Skustack Warehouse with
+//     exists, totalQty and skus [{sku, qty}] (up to 25 bins; each kept 60 s).
 //   Split runs (Nov 24): POST /assemble/job and /assemble/plan take outputs [{itemId, final, qty, toBin, fba?}] (2 to 6):
 //     one break-down, one assembly per part into its bin at the same units per kit, leftover removed once; every card
 //     of the run is locked to the main card. Every plan answer has features { splitOutputs: true, maxOutputs: 6 }.
@@ -1060,7 +1062,8 @@ async function soapUrl(env) {
 }
 
 // Read-only SOAP calls the worker may make. Nothing here adjusts, sets, transfers or adds stock.
-const SOAP_READS = new Set(["GetCurrentUser", "ProductKit_GetKitDetails", "ProductKit_ListKitItems", "ProductWarehouseBin_ListAll_New", "WarehouseBin_ListAll"]);
+const SOAP_READS = new Set(["GetCurrentUser", "ProductKit_GetKitDetails", "ProductKit_ListKitItems", "ProductWarehouseBin_ListAll_New", "WarehouseBin_ListAll",
+  "ProductWarehouseBin_All_ByBinName"]);
 const SOAP_ASSEMBLE = "ProductKit_Assemble_New_4";
 const SOAP_DISASSEMBLE = "ProductKit_Disassemble_New3";
 // Removes the small 0.1 leftover from the From bin after an assembly (found on Shragy's server via /soapops?q=bin).
@@ -1299,6 +1302,58 @@ async function warehouseBinNames(env) {
   walk(xmlTree(xml));
   binListCache = { at: Date.now(), names: [...names].sort((a, b) => a.localeCompare(b)), raw: xml };
   return binListCache;
+}
+
+// ---- Bin contents (Nov 25, for the Hub's "auto-assign a free production bin"). READ-ONLY: what is in each named bin of
+// Skustack Warehouse, from WarehouseBin_ListAll (does the bin exist) and ProductWarehouseBin_All_ByBinName (its products,
+// both reads). Each bin's answer is kept 60 s (the shortest KV keeps); nothing is written to Sellercloud.
+const BIN_CONTENTS_MAX = 25;
+const BIN_CONTENTS_SECS = 60;
+async function binContentsOne(env, name, names, debug) {
+  const hit = names.find((n) => n === name) || names.find((n) => n.toLowerCase() === name.toLowerCase());
+  if (!hit) return { bin: name, exists: false, totalQty: 0, skus: [] };
+  const ck = "bin-contents-v1:" + hit.toLowerCase();
+  const kept = await sharedGet(env, ck);
+  if (!debug && kept && Date.now() - (kept.at || 0) < BIN_CONTENTS_SECS * 1000) return kept.v;
+  const wh = assembleWarehouse(env);
+  const xml = await soapCall(env, "ProductWarehouseBin_All_ByBinName",
+    `<BinName>${xmlEsc(hit)}</BinName><WarehouseID>${wh}</WarehouseID><IncludeQtySoldData>false</IncludeQtySoldData>`);
+  const by = new Map();
+  let rowFields = null, rows = 0;
+  const walk = (n) => {
+    const sku = kid(n, "ProductID", "ProductId", "ProductSKU", "SKU");
+    if (sku && !n.kids.some((c) => /^product(id|sku)$/i.test(c.name) && c.kids.length)) {
+      const whId = kid(n, "WarehouseID");
+      if (whId != null && Number(whId) !== wh) return;
+      const bn = kid(n, "BinName");
+      if (bn && bn.toLowerCase() !== hit.toLowerCase()) return;
+      const q = num(kid(n, "QtyAvailable", "AvailableQty", "PhysicalQty", "Qty", "Quantity", "BinQty"));
+      by.set(sku, (by.get(sku) || 0) + q);
+      rows++; if (!rowFields) rowFields = n.kids.map((c) => c.name);
+      return;
+    }
+    n.kids.forEach(walk);
+  };
+  walk(xmlTree(xml));
+  const skus = [...by].filter(([, q]) => q !== 0).map(([sku, qty]) => ({ sku, qty })).sort((a, b) => b.qty - a.qty || a.sku.localeCompare(b.sku));
+  const v = { bin: hit, exists: true, totalQty: skus.reduce((t, x) => t + x.qty, 0), skus };
+  if (debug) return { ...v, rows, rowFields };   // field names only, to check the reply's shape; never cached
+  await sharedPut(env, ck, { at: Date.now(), v }, BIN_CONTENTS_SECS);
+  return v;
+}
+async function binContents(env, body) {
+  let list = body?.bins;
+  if (typeof list === "string") list = list.split(",");
+  if (!Array.isArray(list)) throw new HttpError(400, "Send { bins: [bin names] }.");
+  const want = [...new Set(list.map((x) => String(x ?? "").trim()).filter(Boolean))];
+  if (!want.length) throw new HttpError(400, "Send at least one bin name.");
+  if (want.length > BIN_CONTENTS_MAX) throw new HttpError(400, `Up to ${BIN_CONTENTS_MAX} bins at a time, not ${want.length}.`);
+  if (want.some((b) => b.length > 60 || /[<>&]/.test(b))) throw new HttpError(400, "A bin name doesn't look right.");
+  const { names } = await warehouseBinNames(env);
+  const bins = [];
+  const debug = body.debug === true;
+  for (const b of want) bins.push(await binContentsOne(env, b, names, debug));
+  return { warehouseId: assembleWarehouse(env), bins };
 }
 
 // The bin's exact name in the assembly warehouse, or a clear 409 if it isn't there.
@@ -3635,6 +3690,19 @@ async function handle(request, env) {
     const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
     if (!ok) return json({ error: "Missing or wrong key." }, 401);
     return json(await mirrorStatus(env));
+  }
+  if (p0 === "/bins/contents") {
+    if (request.method !== "POST") return json({ error: "Use POST for /bins/contents." }, 405);
+    const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
+    const ok = !!k && ((env.APP_KEY && safeEqual(k, env.APP_KEY.trim())) || (env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())));
+    if (!ok) return json({ error: "Missing or wrong key." }, 401);
+    let body;
+    try { body = await request.json(); } catch { return json({ error: "Send the details as JSON." }, 400); }
+    try { return json(await binContents(env, body)); }
+    catch (e) {
+      const st = e instanceof HttpError ? e.status : 500;
+      return json({ error: e.message || String(e), ...(e.busy ? { busy: true, retryAt: e.retryAt || null } : {}) }, st);
+    }
   }
   if (p0 === "/labels/dl") {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Only GET is allowed here.", { status: 405 });
