@@ -5954,10 +5954,10 @@ const TEMUSHIP_FILTERS = [
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "ddlOrderStatus", FilterPropertyName: "OrderStatus", IsDefaultFilter: true, DependencyFilterIDs: [] },
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "lstPicked", FilterPropertyName: "Picked", IsDefaultFilter: false, DependencyFilterIDs: [] },
 ];
-async function temuListPage(env, cutoff, page, pageSize = 50) {
+async function temuListPage(env, cutoff, page, pageSize = 50, desc = false) {
   const url = (await deltaBase(env)) + "/api/Manage/ManageEntity/GetGridData";
   const body = { GlobalSearchKeyWord: null, IncludeTotals: true, Key: null, Kind: 1, PageNumber: page, ResultsPerPage: pageSize,
-    SelectedFilters: TEMUSHIP_FILTERS, SortColumn: "ID", SortDirection: true, ExcludeGridData: false, ...temuExtra };
+    SelectedFilters: TEMUSHIP_FILTERS, SortColumn: "ID", SortDirection: !desc, ExcludeGridData: false, ...temuExtra };
   for (let attempt = 0; attempt < 5; attempt++) {
     await waitIfBusy();
     const token = await deltaGetToken(env);
@@ -6028,16 +6028,17 @@ async function temuShipSome(env, st, max, stopAt) {
   const poOf = (o) => String(o.OrderSourceOrderID || "").trim();
   let page = 1;
   while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
-    const { total, items } = await temuListPage(env, st.cutoff, page);
+    // The label pass reads newest first in big pages: labelled orders are recent, the oldest are Freight ones.
+    const { total, items } = await temuListPage(env, st.cutoff, page, labelMode ? 250 : 50, labelMode);
     if (page === 1) res.left = total;
-    if (!items.length) break;
+    if (!items.length) { res.reachedEnd = true; break; }
     const want = labelMode
       ? items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && labelMap.get(poOf(o))?.tracking)
       : items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(poOf(o)));
     res.hasLabel += items.filter((o) => temuEligible(o, st.cutoff) && labelPos.has(poOf(o))).length;
     if (labelMode) res.labelBad = (res.labelBad || 0) + items.filter((o) => temuEligible(o, st.cutoff) && labelMap.get(poOf(o))?.bad).length;
     res.skipped += items.length - want.length; res.seen += items.length;
-    if (!want.length) { page++; if (page > 60) break; continue; }
+    if (!want.length) { page++; if (page > (labelMode ? 90 : 60)) { res.reachedEnd = true; break; } continue; }
     for (let i = 0; i < want.length && res.shipped + res.failed.length < max && Date.now() < stopAt; i += 25) {
       const part = want.slice(i, Math.min(i + 25, i + (max - res.shipped - res.failed.length)));
       const out = [];
@@ -6066,7 +6067,7 @@ function temuMerge(st, res) {
   st.failedIds = [...new Set([...(st.failedIds || []), ...res.failed.map((f) => f.id)])].slice(-2000);
   st.lastTick = new Date().toISOString(); st.lastLeft = res.left; st.lastSeen = res.seen; st.lastHasLabel = res.hasLabel || 0;
   if (st.limit && st.shipped >= st.limit) { st.on = false; st.stopped = "limit reached"; }
-  if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen)) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
+  if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen && (st.mode !== "label" || res.reachedEnd))) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
   if (st.mode === "label") { st.labelShipped = (st.labelShipped || 0) + res.shipped; st.lastLabelBad = res.labelBad || 0; }
   // Freight pass done: go on to the orders with a label, with their own tracking (when started with &then=label).
   if (!st.on && st.mode !== "label" && st.then === "label" && st.stopped === "no more orders before the cutoff") {
