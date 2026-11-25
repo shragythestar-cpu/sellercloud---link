@@ -5683,6 +5683,8 @@ async function temuBacklogRoute(env, url) {
   if (api === "keys" || api === "dry") for (const [k, v] of url.searchParams) if (k.startsWith("p_")) temuExtra[k.slice(2)] = v;
   const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("cutoff") || "") ? url.searchParams.get("cutoff") : "2026-11-23";
   if (api === "status") return Response.json(await temuState(env));
+  if (api === "whoami") return Response.json({ sellercloudUser: env.SC_USERNAME || null });
+  if (api === "reset") { const st = (await temuState(env)) || {}; if (st.on) return Response.json({ error: "stop the run first" }, { status: 409 }); st.failed = []; st.failedIds = []; await temuSave(env, st); return Response.json(st); }
   if (api === "keys") {
     const { total, items, dataKeys } = await temuListPage(env, cutoff, 1, 3);
     const o = items[0] || {};
