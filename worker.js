@@ -5546,10 +5546,37 @@ function temuEligible(o, cutoff) {
 // One page of unshipped Temu orders created before the cutoff (midnight New York of the cutoff day, +1 day slack;
 // the TimeOfOrder check above decides).
 let temuExtra = {};
+// The exact list Shragy approved: Sellercloud's own "TEMU Shipping" view (Company Temu, Unshipped, Processing,
+// Fully Picked), read through the web app's grid call with the worker's own login (delta token, as the Kit tab does),
+// oldest first. The REST order list can't filter on Fully Picked, so it isn't used to pick orders.
+const TEMUSHIP_FILTERS = [
+  { FilterSelectedValues: [String(TEMUSHIP_COMPANY)], HasValue: true, FilterId: "lstCompanies", FilterPropertyName: "CompanyID", IsDefaultFilter: true, DependencyFilterIDs: [] },
+  { FilterSelectedValues: ["1"], HasValue: true, FilterId: "ddlShipStatus", FilterPropertyName: "ShippingStatus", IsDefaultFilter: true, DependencyFilterIDs: [] },
+  { FilterSelectedValues: ["2"], HasValue: true, FilterId: "ddlOrderStatus", FilterPropertyName: "OrderStatus", IsDefaultFilter: true, DependencyFilterIDs: [] },
+  { FilterSelectedValues: ["2"], HasValue: true, FilterId: "lstPicked", FilterPropertyName: "Picked", IsDefaultFilter: false, DependencyFilterIDs: [] },
+];
 async function temuListPage(env, cutoff, page, pageSize = 50) {
-  const to = new Date(Date.parse(cutoff + "T00:00:00-05:00") + 86400e3).toISOString();
-  const data = await scGet(env, "/Orders", { pageNumber: page, pageSize, shippingStatus: "Unshipped", companyID: TEMUSHIP_COMPANY, createdOnTo: to, ...temuExtra });
-  return { total: data.TotalResults, items: data.Items || [] };
+  const url = (await deltaBase(env)) + "/api/Manage/ManageEntity/GetGridData";
+  const body = { GlobalSearchKeyWord: null, IncludeTotals: true, Key: null, Kind: 1, PageNumber: page, ResultsPerPage: pageSize,
+    SelectedFilters: TEMUSHIP_FILTERS, SortColumn: "ID", SortDirection: true, ExcludeGridData: false, ...temuExtra };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await waitIfBusy();
+    const token = await deltaGetToken(env);
+    subrequests++; scCalls++;
+    const r = await fetch(url, { method: "POST", redirect: "manual",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json", "X-Requested-With": "XMLHttpRequest" },
+      body: JSON.stringify(body) });
+    if (r.status === 401 && attempt === 0) { deltaToken = null; await sharedDel(env, DELTA_TOKEN_KEY); continue; }
+    const text = await r.text();
+    if (r.status === 409 || r.status === 429) { const ms = busyWait(r, attempt, text); noteBusy(ms); if (Date.now() + ms < deadline) { await sleep(ms); continue; } }
+    let j = null; try { j = JSON.parse(text); } catch {}
+    if (!r.ok || !j) throw new HttpError(502, `Sellercloud's order grid failed (${r.status}). ${text.replace(/\s+/g, " ").slice(0, 200)}`);
+    const d = j.Data || j.data || {};
+    const items = (d.Grid || []).map((o) => ({ ...o, ID: o.ID ?? o.OrderID ?? o.Id }));
+    const total = d.TotalResults ?? d.Total ?? d.TotalCount ?? d.Totals?.TotalResults ?? null;
+    return { total, items, dataKeys: Object.keys(d) };
+  }
+  throw new HttpError(503, "Sellercloud's order grid is busy.");
 }
 async function temuFresh(env, poIds) {
   const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: poIds });
@@ -5620,9 +5647,9 @@ async function temuBacklogRoute(env, url) {
   const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("cutoff") || "") ? url.searchParams.get("cutoff") : "2026-11-23";
   if (api === "status") return Response.json(await temuState(env));
   if (api === "keys") {
-    const { total, items } = await temuListPage(env, cutoff, 1, 3);
+    const { total, items, dataKeys } = await temuListPage(env, cutoff, 1, 3);
     const o = items[0] || {};
-    return Response.json({ total, keys: Object.keys(o), itemKeys: Object.keys((o.Items || [])[0] || {}), item0: (o.Items || [])[0] || null, sample: items.map((x) => ({ ID: x.ID, CompanyID: x.CompanyID, OrderSource: x.OrderSource, ShippingStatus: x.ShippingStatus, StatusCode: x.StatusCode, TimeOfOrder: x.TimeOfOrder, CreatedOn: x.CreatedOn, Picked: x.Picked ?? x.PickedStatus ?? x.IsPicked ?? null, po: x.OrderSourceOrderID })) });
+    return Response.json({ total, dataKeys, keys: Object.keys(o), itemKeys: Object.keys((o.Items || [])[0] || {}), item0: (o.Items || [])[0] || null, sample: items.map((x) => ({ ID: x.ID, CompanyID: x.CompanyID, OrderSource: x.OrderSource, ShippingStatus: x.ShippingStatus, StatusCode: x.StatusCode, TimeOfOrder: x.TimeOfOrder, CreatedOn: x.CreatedOn, Picked: x.Picked ?? x.PickedStatus ?? x.IsPicked ?? null, po: x.OrderSourceOrderID })) });
   }
   if (api === "dry") {
     const page = parseInt(url.searchParams.get("page") || "1", 10) || 1;
@@ -5634,6 +5661,15 @@ async function temuBacklogRoute(env, url) {
       else { const k = [o.CompanyID, o.ShippingStatus, o.StatusCode, temuNyDay(o.TimeOfOrder) < cutoff ? "old" : "new"].join("/"); why[k] = (why[k] || 0) + 1; }
     }
     return Response.json({ total, page, size, rows: items.length, eligible: elig, byMonth: days, notEligible: why });
+  }
+  if (api === "drypage") {
+    const html = `<!doctype html><meta charset="utf-8"><title>dry</title><pre id="o">working…</pre><script>
+const q=new URLSearchParams(location.search);const o=document.getElementById('o');const T=q.get('t');const C=q.get('cutoff')||'2026-11-23';
+(async()=>{let el=0,rows=0,tot=null;const m={},nw={};for(let p=1;p<=200;p++){let j=null;for(let i=0;i<4&&!j;i++){const r=await fetch('/temu-backlog?api=dry&size=250&page='+p+'&cutoff='+C+'&t='+encodeURIComponent(T));j=r.ok?await r.json():null;if(!j)await new Promise(z=>setTimeout(z,4000));}
+if(!j){o.textContent='FAILED at page '+p;return;}tot=j.total;rows+=j.rows;el+=j.eligible;for(const[k,v]of Object.entries(j.byMonth))m[k]=(m[k]||0)+v;for(const[k,v]of Object.entries(j.notEligible))nw[k]=(nw[k]||0)+v;
+o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby month '+JSON.stringify(m)+'\\nnot eligible '+JSON.stringify(nw);if(j.rows<250)break;}o.textContent='DONE '+o.textContent;})();
+<\/script>`;
+    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
   }
   if (api === "ship") { // a few now, for the test
     const n = Math.min(10, Math.max(1, parseInt(url.searchParams.get("n") || "1", 10) || 1));
