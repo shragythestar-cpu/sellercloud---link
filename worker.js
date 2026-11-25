@@ -4618,8 +4618,12 @@ async function labelsDiagSc(env, url) {
   if (api === "ids") {
     const day = await labelsCall(env, "/day", { date });
     const ids = new Set();
-    for (const b of day.batches || []) for (const l of b.lines || []) if (l.orderId) ids.add(String(l.orderId).trim());
-    return Response.json({ ids: [...ids] });
+    const lines = [];
+    for (const b of day.batches || []) for (const l of b.lines || []) {
+      if (l.orderId) ids.add(String(l.orderId).trim());
+      lines.push([b.carrier || b.platform || "", l.idx ?? "", l.page ?? "", l.tracking || "", l.orderId || "", l.qty ?? "", String(l.sku || "").slice(0, 50)].join("|"));
+    }
+    return Response.json({ ids: [...ids], lines });
   }
   if (api === "orders") {
     const ids = (url.searchParams.get("ids") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 50);
@@ -4639,13 +4643,13 @@ async function labelsDiagSc(env, url) {
     const html = `<!doctype html><meta charset="utf-8"><title>sc</title><pre id="o">working…</pre><script>
 const q=new URLSearchParams(location.search);const T=q.get('t');const o=document.getElementById('o');const log=[];
 const get=async(qs)=>{for(let i=0;i<4;i++){const r=await fetch('/labels-diag?t='+encodeURIComponent(T)+'&'+qs);const j=await r.json().catch(()=>null);if(r.ok&&j)return j;log.push('retry '+r.status+' '+qs.slice(0,40));await new Promise(z=>setTimeout(z,3000));}throw new Error('failed '+qs.slice(0,60));};
-(async()=>{try{const {ids}=await get('api=ids');const rows=[];let keys=null,pfx='0';
+(async()=>{try{const {ids,lines}=await get('api=ids');const rows=[];let keys=null,pfx='0';
 for(let i=0;i<ids.length;i+=50){const part=ids.slice(i,i+50).join(',');let j=await get('api=orders&keys='+(i?0:1)+'&pfx='+pfx+'&ids='+encodeURIComponent(part));
 if(i===0&&!j.rows.length){pfx='1';j=await get('api=orders&keys=1&pfx=1&ids='+encodeURIComponent(part));}
 if(j.keys)keys=j.keys;rows.push(...j.rows);o.textContent='orders '+rows.length+'/'+ids.length;}
 const src={};rows.forEach(r=>{const s=r.split('|')[4];src[s]=(src[s]||0)+1;});const ch=Object.entries(src).sort((a,b)=>b[1]-a[1])[0]?.[0]||'';
 const un=[];let total=0;for(let p=1;p<=60;p++){const j=await get('api=unshipped&page='+p+(ch?'&channel='+ch:''));total=j.total;un.push(...j.rows);o.textContent='unshipped '+un.length+'/'+total;if(!j.rows.length||un.length>=total)break;}
-o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.join(' / '),'== ORDERS',...rows,'== UNSHIPPED',...un,'== END'].join('\\n');}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
+o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.join(' / '),'== ORDERS',...rows,'== UNSHIPPED',...un,'== LINES',...lines,'== END'].join('\\n');}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
 <\/script>`;
     return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
   }
