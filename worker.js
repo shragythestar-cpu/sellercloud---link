@@ -4581,7 +4581,7 @@ async function labelsSign(secret, batchId, exp) {
 }
 async function labelsPdf(env, request, batchId, filename, cors) {
   const base = { "content-type": "application/pdf", "content-disposition": `attachment; filename="${filename}"`, "accept-ranges": "bytes",
-    "cache-control": "private, no-store", ...(cors ? { ...corsHeaders(), "access-control-expose-headers": "Content-Disposition, Content-Range, Content-Length, Accept-Ranges" } : {}) };
+    "cache-control": "private, no-store", ...(cors === "any" ? { "access-control-allow-origin": "*", "access-control-expose-headers": "Content-Disposition, Content-Range, Content-Length, Accept-Ranges" } : cors ? { ...corsHeaders(), "access-control-expose-headers": "Content-Disposition, Content-Range, Content-Length, Accept-Ranges" } : {}) };
   const range = (request.headers.get("Range") || "").trim();
   const m = range.match(/^bytes=(\d*)-(\d*)$/);
   if (m && (m[1] || m[2])) {
@@ -4673,9 +4673,10 @@ async function labelsDirect(request, env, url) {
   if (!safeEqual(sig, await labelsSign(secret, batchId, Number(exp)))) return gone();
   let batch;
   try { ({ batch } = await labelsCall(env, "/get", { batchId })); } catch { return new Response("That batch isn't there any more.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8" } }); }
-  // CORS for the Hub's own origins (Nov 25) so the FBM printing tab can read the PDF it was given a link to.
-  const res = await labelsPdf(env, request, batchId, labelsFilename(batch), true);
-  return res || new Response("That batch's PDF isn't there.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", ...corsHeaders() } });
+  // CORS (Nov 25): the FBM printing tab reads the PDF it was given a link to. The signed, 15-minute link is itself the
+  // permission, so any origin may read it (the Hub's frame origin isn't always a monday.com / monday.app host).
+  const res = await labelsPdf(env, request, batchId, labelsFilename(batch), "any");
+  return res || new Response("That batch's PDF isn't there.", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "access-control-allow-origin": "*" } });
 }
 async function labelsRoute(request, env, path, url) {
   switch (path) {
