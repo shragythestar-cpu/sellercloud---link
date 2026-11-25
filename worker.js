@@ -6155,8 +6155,10 @@ o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby mont
     const st = (await temuState(env)) || { cutoff, shipped: 0, failed: [], failedIds: [] };
     if (st.on) return Response.json({ error: "The background run is on; stop it first." }, { status: 409 });
     st.cutoff = cutoff;
+    const keep = st.mode || null;
+    if (url.searchParams.get("mode") === "label") st.mode = "label";
     const res = await temuShipSome(env, st, n, Date.now() + 20_000);
-    temuMerge(st, res); st.on = false; await temuSave(env, st);
+    temuMerge(st, res); st.on = false; st.mode = keep; await temuSave(env, st);
     return Response.json({ res, state: st });
   }
   if (api === "start") {
