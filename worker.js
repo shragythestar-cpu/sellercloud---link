@@ -4,6 +4,7 @@
 // It READS from Sellercloud: sign-in, product search, stock, photos, kit recipes.
 // The one exception is kit assembly (POST /assemble), which changes stock and stays SWITCHED OFF
 // until ASSEMBLE_ENABLED = yes. See the "Kit assembly" section below.
+// Second exception (Nov 25): /temu-backlog marks old unshipped Temu orders shipped, only while switched on. See "Temu backlog".
 // Its only writes are to ONE monday board, "Sellercloud Products" (SYNC_BOARD_ID), never the
 // Production Schedule boards, and posts to ONE Google Chat space (CHAT_WEBHOOK) from /pull.
 //
@@ -3711,6 +3712,7 @@ async function handle(request, env) {
     }
   }
   if (p0 === "/labels-diag") return labelsDiag(env, url, request);
+  if (p0 === "/temu-backlog") return temuBacklogRoute(env, url);
   if (p0 === "/labels/dl") {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Only GET is allowed here.", { status: 405 });
     return labelsDirect(request, env, url);
@@ -5489,6 +5491,165 @@ async function mirrorStatus(env) {
   return { enabled: mirrorOn(env), lastRun: last, lastError: last?.error || null, counts, items };
 }
 
+// ── Temu backlog: mark old unshipped Temu orders shipped in Sellercloud (Nov 25, Shragy's ask) ──
+// Sellercloud isn't linked back to Temu, so this only changes Sellercloud's own record. Carrier Other, method Freight,
+// no tracking (none is held for these orders). Only orders that are ALL of: company Temu (372), Unshipped, Processing,
+// and ordered before the cutoff day (New York time). One REST call per order (PUT Orders/ShippingStatus/SinglePackage);
+// Sellercloud has no bulk ship call. Runs on the 2-minute timer while switched on (KV temuship:state), a few hundred
+// orders a tick so the Hub and the sync keep room under Sellercloud's 10,800 calls an hour.
+// Control: GET /temu-backlog?t=<token>&api=status|keys|dry|ship|start|stop (token: only its SHA-256 is here).
+// mark-shipped helper is shared: scMarkShipped(env, orderId, { carrier, service, tracking, shipDate }).
+const TEMUSHIP_HASH = "b347c84d14d86fea749ba28fb67a0b6743b5b76238da1cbb21ce5de11a49bd4b";
+const TEMUSHIP_STATE = "temuship:state";
+const TEMUSHIP_COMPANY = 372;
+const TEMUSHIP_TICK_MAX = 180;
+async function scMarkShipped(env, orderId, o = {}) {
+  const base = await getBase(env);
+  const path = "/Orders/ShippingStatus/SinglePackage";
+  const body = {
+    OrderID: Number(orderId),
+    ShipDate: o.shipDate || new Date(Date.now() - 60_000).toISOString(),
+    ShippingCarrier: o.carrier || "Other", CarrierName: o.carrier || "Other",
+    ShippingService: o.service || "Freight", ShippingMethod: o.service || "Freight",
+    TrackingNumber: o.tracking || "",
+  };
+  for (let attempt = 0; attempt < 6; attempt++) {
+    await waitIfBusy();
+    const token = await getToken(env, base);
+    subrequests++; scCalls++;
+    const r = await fetch(base + path, {
+      method: "PUT",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (r.status === 401 && attempt === 0) { await dropToken(env); continue; }
+    const text = (await r.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300);
+    if (r.status === 409 || r.status === 429) {
+      noteRefusal(path, r.status, text, r);
+      const ms = busyWait(r, attempt, text); noteBusy(ms);
+      if (Date.now() + ms < deadline) { await sleep(ms); continue; }
+      return { ok: false, status: r.status, said: text, busy: true };
+    }
+    return { ok: r.ok, status: r.status, said: text };
+  }
+  return { ok: false, status: 409, said: "too many requests", busy: true };
+}
+const temuNyDay = (t) => { try { return new Date(t).toLocaleDateString("en-CA", { timeZone: "America/New_York" }); } catch { return ""; } };
+const temuUnshipped = (v) => v === 1 || /^unshipped$/i.test(String(v));
+const temuProcessing = (v) => v === 2 || /^(processing|inprocess)$/i.test(String(v));
+function temuEligible(o, cutoff) {
+  return Number(o.CompanyID) === TEMUSHIP_COMPANY && temuUnshipped(o.ShippingStatus) && temuProcessing(o.StatusCode)
+    && /^PO-211-/.test(String(o.OrderSourceOrderID || "")) && temuNyDay(o.TimeOfOrder || o.CreatedOn) < cutoff;
+}
+// One page of unshipped Temu orders created before the cutoff (midnight New York of the cutoff day, +1 day slack;
+// the TimeOfOrder check above decides).
+async function temuListPage(env, cutoff, page, pageSize = 50) {
+  const to = new Date(Date.parse(cutoff + "T00:00:00-05:00") + 86400e3).toISOString();
+  const data = await scGet(env, "/Orders", { pageNumber: page, pageSize, shippingStatus: "Unshipped", companyID: TEMUSHIP_COMPANY, createdOnTo: to });
+  return { total: data.TotalResults, items: data.Items || [] };
+}
+async function temuFresh(env, poIds) {
+  const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: poIds });
+  const m = {}; for (const o of data.Items || []) m[o.ID] = o; return m;
+}
+// Ships up to max eligible orders now; checks each one's status again right after.
+async function temuShipSome(env, st, max, stopAt) {
+  const res = { shipped: 0, failed: [], skipped: 0, seen: 0, left: null };
+  let page = 1;
+  while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
+    const { total, items } = await temuListPage(env, st.cutoff, page);
+    if (page === 1) res.left = total;
+    if (!items.length) break;
+    const want = items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID));
+    res.skipped += items.length - want.length; res.seen += items.length;
+    if (!want.length) { page++; if (page > 60) break; continue; }
+    for (let i = 0; i < want.length && res.shipped + res.failed.length < max && Date.now() < stopAt; i += 25) {
+      const part = want.slice(i, Math.min(i + 25, i + (max - res.shipped - res.failed.length)));
+      const out = [];
+      for (let j = 0; j < part.length; j += 3) {
+        out.push(...await Promise.all(part.slice(j, j + 3).map(async (o) => ({ o, r: await scMarkShipped(env, o.ID).catch((e) => ({ ok: false, said: e.message })) }))));
+        if (Date.now() > stopAt) break;
+      }
+      const fresh = await temuFresh(env, out.map((x) => x.o.OrderSourceOrderID)).catch(() => ({}));
+      for (const { o, r } of out) {
+        const f = fresh[o.ID];
+        if (r.ok && f && !temuUnshipped(f.ShippingStatus)) res.shipped++;
+        else if (r.busy) { /* not tried; next tick picks it up */ }
+        else res.failed.push({ id: o.ID, po: o.OrderSourceOrderID, status: r.status || null, said: (r.said || "").slice(0, 160), after: f ? f.ShippingStatus : null });
+      }
+      if (out.some((x) => x.r.busy)) return res;
+    }
+    // shipped orders drop out of the Unshipped list, so page 1 again (unless the whole page was skipped)
+  }
+  return res;
+}
+async function temuState(env) { return (env.TOKEN_KV && (await env.TOKEN_KV.get(TEMUSHIP_STATE, "json"))) || null; }
+async function temuSave(env, st) { if (env.TOKEN_KV) await env.TOKEN_KV.put(TEMUSHIP_STATE, JSON.stringify(st)); }
+function temuMerge(st, res) {
+  st.shipped = (st.shipped || 0) + res.shipped;
+  st.failed = [...(st.failed || []), ...res.failed].slice(-300);
+  st.failedIds = [...new Set([...(st.failedIds || []), ...res.failed.map((f) => f.id)])].slice(-2000);
+  st.lastTick = new Date().toISOString(); st.lastLeft = res.left; st.lastSeen = res.seen;
+  if (st.limit && st.shipped >= st.limit) { st.on = false; st.stopped = "limit reached"; }
+  if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen)) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
+  return st;
+}
+async function temuBacklogTick(env) {
+  const st = await temuState(env);
+  if (!st || !st.on) return;
+  if (st.busyTick && Date.now() - Date.parse(st.busyTick) < 170_000) return; // last tick still running
+  st.busyTick = new Date().toISOString(); await temuSave(env, st);
+  let res;
+  try { res = await temuShipSome(env, st, Math.min(TEMUSHIP_TICK_MAX, st.limit ? st.limit - (st.shipped || 0) : TEMUSHIP_TICK_MAX), Date.now() + 100_000); }
+  catch (e) { const s2 = (await temuState(env)) || st; s2.lastError = String(e.message || e).slice(0, 300); s2.busyTick = null; await temuSave(env, s2); return; }
+  const s2 = (await temuState(env)) || st;
+  if (!s2.on) { s2.busyTick = null; temuMerge(s2, res); s2.on = false; await temuSave(env, s2); return; }
+  temuMerge(s2, res); s2.busyTick = null; s2.lastError = null; await temuSave(env, s2);
+}
+async function temuBacklogRoute(env, url) {
+  const t = (url.searchParams.get("t") || "").trim();
+  const h = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (!t || !safeEqual(h, TEMUSHIP_HASH)) return new Response("Not found.", { status: 404 });
+  deadline = Date.now() + 25_000;
+  const api = url.searchParams.get("api") || "status";
+  const cutoff = /^\d{4}-\d{2}-\d{2}$/.test(url.searchParams.get("cutoff") || "") ? url.searchParams.get("cutoff") : "2026-11-23";
+  if (api === "status") return Response.json(await temuState(env));
+  if (api === "keys") {
+    const { total, items } = await temuListPage(env, cutoff, 1, 3);
+    const o = items[0] || {};
+    return Response.json({ total, keys: Object.keys(o), sample: items.map((x) => ({ ID: x.ID, CompanyID: x.CompanyID, OrderSource: x.OrderSource, ShippingStatus: x.ShippingStatus, StatusCode: x.StatusCode, TimeOfOrder: x.TimeOfOrder, CreatedOn: x.CreatedOn, Picked: x.Picked ?? x.PickedStatus ?? x.IsPicked ?? null, po: x.OrderSourceOrderID })) });
+  }
+  if (api === "dry") {
+    const page = parseInt(url.searchParams.get("page") || "1", 10) || 1;
+    const size = Math.min(500, parseInt(url.searchParams.get("size") || "500", 10) || 500);
+    const { total, items } = await temuListPage(env, cutoff, page, size);
+    const days = {}; let elig = 0; const why = {};
+    for (const o of items) {
+      if (temuEligible(o, cutoff)) { elig++; const d = temuNyDay(o.TimeOfOrder).slice(0, 7); days[d] = (days[d] || 0) + 1; }
+      else { const k = [o.CompanyID, o.ShippingStatus, o.StatusCode, temuNyDay(o.TimeOfOrder) < cutoff ? "old" : "new"].join("/"); why[k] = (why[k] || 0) + 1; }
+    }
+    return Response.json({ total, page, size, rows: items.length, eligible: elig, byMonth: days, notEligible: why });
+  }
+  if (api === "ship") { // a few now, for the test
+    const n = Math.min(10, Math.max(1, parseInt(url.searchParams.get("n") || "1", 10) || 1));
+    const st = (await temuState(env)) || { cutoff, shipped: 0, failed: [], failedIds: [] };
+    if (st.on) return Response.json({ error: "The background run is on; stop it first." }, { status: 409 });
+    st.cutoff = cutoff;
+    const res = await temuShipSome(env, st, n, Date.now() + 20_000);
+    temuMerge(st, res); st.on = false; await temuSave(env, st);
+    return Response.json({ res, state: st });
+  }
+  if (api === "start") {
+    const st = (await temuState(env)) || { shipped: 0, failed: [], failedIds: [] };
+    st.cutoff = cutoff; st.on = true; st.stopped = null; st.startedAt = st.startedAt || new Date().toISOString();
+    st.limit = parseInt(url.searchParams.get("limit") || "0", 10) || 0;
+    await temuSave(env, st);
+    return Response.json(st);
+  }
+  if (api === "stop") { const st = (await temuState(env)) || {}; st.on = false; st.stopped = "stopped by hand"; await temuSave(env, st); return Response.json(st); }
+  return new Response("Not found.", { status: 404 });
+}
+
 export default {
   async scheduled(event, env, ctx) {
     // The live-board copy has its own 5-minute timer and does nothing else.
@@ -5502,6 +5663,8 @@ export default {
     quickBusy = false;
     ctx.waitUntil(runSync(env, { seconds: 120, scheduled: true }).catch((e) => console.log("sync failed: " + e.message))
       .finally(() => tallyCalls(env)));
+    // Temu backlog (Nov 25): ships a few hundred old Temu orders a tick while switched on.
+    ctx.waitUntil(temuBacklogTick(env).catch((e) => console.log("temu backlog failed: " + e.message)));
     // Background kit runs: a nudge so the queue's alarm is never lost.
     if (env.JOBS) ctx.waitUntil(jobCall(env, "/kick", {}).catch(() => {}));
   },
