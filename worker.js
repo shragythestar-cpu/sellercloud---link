@@ -84,10 +84,11 @@
 //     /labels/stats?from=&to=&groupBy=day|week|month, POST /labels/downloaded {batchId,by} (ASSEMBLE_KEY or APP_KEY).
 //     PDFs in KV (TOKEN_KV, labels:file:<batchId>); batches and lines in the SQLite Durable Object LabelStore (binding LABELS).
 //   Scan station (Nov 25): the Hub's FBM printing tab (GET /scan only says so now). With the Hub key:
-//     GET /labels/day?date= (the day's batches, lines, printed packages, UPC links); GET /labels/upc?upc= (Sellercloud
+//     GET /labels/day?date= (the day's batches, lines, printed packages, UPC links; each line has scSku, its Sellercloud SKU,
+//     learned read-only from one Sellercloud order per product title and kept in KV labels:titlesku:v1); GET /labels/upc?upc= (Sellercloud
 //     products with that UPC, read-only, kept 7 days in KV, plus saved links); POST /labels/printed {items:[{batchId,pkg}],by};
 //     POST /labels/link {upc,sku[,remove]}. The page prints a scanned product's labels grouped by units per package.
-//     GET /labels/photo?sku= (read-only: the product's photo link from Sellercloud, kept 7 days in KV; none kept 1 day).
+//     GET /labels/photo?sku= (read-only: the product's photo link from Sellercloud, also tried without the platform name; kept 7 days in KV; none kept 1 day).
 //   /assemble/platforms  (ASSEMBLE_KEY) platforms for "Create final SKU": prefix and company each (company: Text PLATFORM_COMPANY_<KEY>)
 //   POST /assemble/create-product {sku,name?,platform? or companyName/companyId,sourceSku?,productType?,itemId?}
 //     (ASSEMBLE_KEY, only when ASSEMBLE_ENABLED = yes) creates ONE product in that company. Refuses an SKU that exists
@@ -4844,13 +4845,84 @@ async function scanUpcProducts(env, raw) {
   if (products.length && env.TOKEN_KV) await env.TOKEN_KV.put(ck, JSON.stringify(res), { expirationTtl: SCAN_UPC_TTL }).catch(() => {});
   return res;
 }
+// A channel SKU without its platform name: "TEMU - M&Ms Peanut butter" -> "M&Ms Peanut butter".
+function labelsBaseSku(sku) {
+  return String(sku || "").replace(/^\s*(temu|eaw\s*fbm|eaw\s*fba|eaw|fbm|fba|walmart|wfs|woot)\s*[-_:.]\s*/i, "").trim();
+}
+const LABELS_TITLE_KEY = "labels:titlesku:v1";
+const labelsTitle = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ").slice(0, 200);
+// Read-only. Learns product title -> Sellercloud SKU from one Sellercloud order per title (kept in KV, so only new titles
+// cost a lookup), then sets line.scSku on every line of the day. A title that can't be resolved is retried the next day.
+async function labelsAddScSkus(env, day, date) {
+  const all = [];
+  for (const b of day.batches || []) for (const l of b.lines || []) all.push(l);
+  if (!all.length) return;
+  let map = {};
+  try { map = JSON.parse((env.TOKEN_KV && (await env.TOKEN_KV.get(LABELS_TITLE_KEY))) || "{}") || {}; } catch { map = {}; }
+  const known = (t) => typeof map[t] === "string" && map[t] && !map[t].startsWith("?");
+  const byOrder = new Map();
+  for (const l of all) {
+    const oid = String(l.orderId || "").trim();
+    if (!oid) continue;
+    if (!byOrder.has(oid)) byOrder.set(oid, new Set());
+    byOrder.get(oid).add(labelsTitle(l.sku));
+  }
+  const need = [...new Set(all.map((l) => labelsTitle(l.sku)))].filter((t) => t && !known(t) && map[t] !== "?" + date);
+  if (need.length) {
+    const picks = new Set();
+    for (const t of need) {
+      let single = null, any = null;
+      for (const [oid, ts] of byOrder) {
+        if (!ts.has(t)) continue;
+        if (!any) any = oid;
+        if (ts.size === 1) { single = oid; break; }
+      }
+      if (single || any) picks.add(single || any);
+    }
+    const ids = [...picks].slice(0, 300);
+    const orders = [];
+    const stopAt = Date.now() + 12_000;
+    for (let i = 0; i < ids.length && Date.now() < stopAt; i += 50) {
+      const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 50, orderSourceOrderIDList: ids.slice(i, i + 50) });
+      orders.push(...(data?.Items || []));
+    }
+    // Two passes: single-product orders first, then mixed orders by elimination or matching name.
+    for (let pass = 0; pass < 2; pass++) {
+      for (const o of orders) {
+        const titles = [...(byOrder.get(String(o.OrderSourceOrderID || "").trim()) || [])];
+        const items = (o.Items || []).filter((i) => i?.ProductID);
+        const pids = [...new Set(items.map((i) => String(i.ProductID)))];
+        if (!titles.length || !pids.length) continue;
+        if (titles.length === 1 && pids.length === 1) { if (!known(titles[0])) map[titles[0]] = pids[0]; continue; }
+        for (const t of titles) {
+          if (known(t)) continue;
+          const byName = items.filter((i) => labelsTitle(i.DisplayName) === t || labelsTitle(i.ProductName) === t);
+          if (byName.length === 1) { map[t] = String(byName[0].ProductID); continue; }
+          const used = new Set(titles.filter(known).map((x) => map[x]));
+          const left = pids.filter((p) => !used.has(p));
+          const open = titles.filter((x) => !known(x));
+          if (pass === 1 && open.length === 1 && left.length === 1) map[t] = left[0];
+        }
+      }
+    }
+    for (const t of need) if (!known(t) && ids.length && Date.now() < stopAt) map[t] = "?" + date;
+    if (env.TOKEN_KV) await env.TOKEN_KV.put(LABELS_TITLE_KEY, JSON.stringify(map)).catch(() => {});
+  }
+  for (const l of all) {
+    const v = map[labelsTitle(l.sku)];
+    l.scSku = v && !v.startsWith("?") ? v : null;
+  }
+}
 async function scanRoute(request, env, path, url) {
   const body = request.method === "POST" ? await request.json().catch(() => ({})) : {};
   switch (path) {
     case "/labels/day": {
       const date = (url.searchParams.get("date") || "").trim();
       if (!isDay(date)) return json({ error: "Add ?date=YYYY-MM-DD." }, 400);
-      return json(await labelsCall(env, "/day", { date }));
+      const day = await labelsCall(env, "/day", { date });
+      // Each line gets scSku, the Sellercloud SKU of its product (uploads carry the product title as sku).
+      try { await labelsAddScSkus(env, day, date); } catch (e) { day.scSkuError = String(e?.message || e).slice(0, 200); }
+      return json(day);
     }
     case "/labels/upc": {
       const upc = (url.searchParams.get("upc") || "").trim();
@@ -4867,10 +4939,14 @@ async function scanRoute(request, env, path, url) {
       if (hit !== null) return json({ sku, url: hit || null, cached: true });
       let photo = null;
       try {
-        const data = await scGet(env, "/ProductImage", { productID: sku });
-        const list = Array.isArray(data) ? data : data?.Images || data?.Items || [];
-        const pick = list.find((i) => i?.IsDefault && i?.Url) || list.find((i) => i?.Url);
-        photo = pick?.Url || null;
+        // The channel SKU first (e.g. "TEMU - M&Ms Peanut butter"), then the same SKU without the platform name.
+        for (const id of [...new Set([sku, labelsBaseSku(sku)])].filter(Boolean)) {
+          const data = await scGet(env, "/ProductImage", { productID: id });
+          const list = Array.isArray(data) ? data : data?.Images || data?.Items || [];
+          const pick = list.find((i) => i?.IsDefault && i?.Url) || list.find((i) => i?.Url);
+          photo = pick?.Url || null;
+          if (photo) break;
+        }
       } catch (e) {
         return json({ sku, url: null, error: String(e?.message || e).slice(0, 200) });
       }
