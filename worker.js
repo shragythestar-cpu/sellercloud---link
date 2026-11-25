@@ -4646,7 +4646,7 @@ const get=async(qs)=>{for(let i=0;i<4;i++){const r=await fetch('/labels-diag?t='
 (async()=>{try{const {ids,lines}=await get('api=ids');const rows=[];let keys=null,pfx='0';
 const N=parseInt(q.get('n')||'20',10);const bad=[];for(let i=0;i<ids.length;i+=N){const part=ids.slice(i,i+N).join(',');let j;try{j=await get('api=orders&keys='+(i?0:1)+'&pfx='+pfx+'&ids='+encodeURIComponent(part));}catch(e){j={rows:[]};for(const one of ids.slice(i,i+N)){try{const k=await get('api=orders&pfx='+pfx+'&ids='+encodeURIComponent(one));j.rows.push(...k.rows);}catch(e2){bad.push(one);}}}
 if(i===0&&!j.rows.length){pfx='1';j=await get('api=orders&keys=1&pfx=1&ids='+encodeURIComponent(part));}
-if(j.keys)keys=j.keys;rows.push(...j.rows);o.textContent='orders '+rows.length+'/'+ids.length;}
+if(j.keys)keys=j.keys;rows.push(...j.rows);o.textContent='orders '+rows.length+'/'+ids.length+' bad '+bad.length+' log '+log.slice(-3).join(' / ');}
 const src={};rows.forEach(r=>{const s=r.split('|')[4];src[s]=(src[s]||0)+1;});const ch=Object.entries(src).sort((a,b)=>b[1]-a[1])[0]?.[0]||'';
 const un=[];let total=0;for(let p=1;p<=60;p++){const j=await get('api=unshipped&page='+p+(ch?'&channel='+ch:''));total=j.total;un.push(...j.rows);o.textContent='unshipped '+un.length+'/'+total;if(!j.rows.length||un.length>=total)break;}
 o.textContent=['IDS '+ids.length,'PFX '+pfx,'KEYS '+JSON.stringify(keys),'SRC '+JSON.stringify(src),'CH '+ch,'UNSHIPPED_TOTAL '+total,'LOG '+log.slice(0,20).join(' / '),'BAD '+bad.join(','),'== ORDERS',...rows,'== UNSHIPPED',...un,'== LINES',...lines,'== END'].join('\\n');}catch(e){o.textContent='ERROR '+e.message+' '+log.join(' / ');}})();
