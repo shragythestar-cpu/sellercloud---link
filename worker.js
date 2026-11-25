@@ -4636,7 +4636,10 @@ async function labelsDiagSc(env, url, request) {
   if (api === "oimg") {
     const ids = (url.searchParams.get("ids") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 25);
     const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids });
-    return Response.json((data.Items || []).map((o) => ({ id: o.OrderSourceOrderID, items: (o.Items || []).map((i) => ({ sku: i.ProductID, img: i.ImageURL, name: (i.DisplayName || "").slice(0, 60) })) })));
+    const res = (data.Items || []).map((o) => ({ id: o.OrderSourceOrderID, items: (o.Items || []).map((i) => ({ sku: i.ProductID, img: i.ImageURL, name: (i.DisplayName || "").slice(0, 120) })) }));
+    const k = url.searchParams.get("k");
+    if (k && env.DIAG_DB) await env.DIAG_DB.prepare("INSERT OR REPLACE INTO diag (k, v, at) VALUES (?, ?, ?)").bind(k.slice(0, 40), JSON.stringify(res), new Date().toISOString()).run();
+    return Response.json(k ? { saved: res.length } : res);
   }
   if (api === "cat") {
     const id = (url.searchParams.get("sku") || "").trim();
