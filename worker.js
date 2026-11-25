@@ -4626,7 +4626,13 @@ async function labelsDiagSc(env, url, request) {
     if (url.searchParams.get("short") === "1") return [o.OrderSourceOrderID || "", String(o.TimeOfOrder || o.CreatedOn || "").slice(0, 16)].join("|");
     return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), String(o.TimeOfOrder || "").slice(0, 16), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
   };
-  if (api === "photo") return Response.json(await labelsPhoto(env, (url.searchParams.get("sku") || "").trim()));
+  if (api === "photo") return Response.json(await labelsPhoto(env, (url.searchParams.get("sku") || "").trim(), url.searchParams.get("fresh") === "1"));
+  if (api === "photos") {
+    const skus = (url.searchParams.get("skus") || "").split("~").map((x) => x.trim()).filter(Boolean).slice(0, 12);
+    const out = [];
+    for (const k of skus) out.push(await labelsPhoto(env, k, true));
+    return Response.json(out.map((o) => [o.sku, o.url ? "PHOTO" : "none", (o.tried || []).join(" > "), o.error || ""].join(" | ")));
+  }
   if (api === "oimg") {
     const ids = (url.searchParams.get("ids") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 25);
     const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids });
@@ -4947,24 +4953,33 @@ async function labelsAddScSkus(env, day, date) {
 }
 // A product's photo link: the catalog image (as the Hub's product search shows it), else Sellercloud's product images;
 // the channel SKU first, then the same SKU without the platform name. Kept 7 days in KV (none: 1 hour).
-async function labelsPhoto(env, sku) {
-  const ck = `labels:photo2:${sku.toLowerCase()}`;
-  const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck) : null;
+// A Sellercloud image URL that is a real photo (Sellercloud shows NoImageAvailable.gif for products with none).
+function labelsRealPhoto(u) {
+  const s = String(u || "").trim();
+  return /^https?:\/\//i.test(s) && !/NoImageAvailable|no[-_ ]?image/i.test(s) ? s : null;
+}
+async function labelsPhoto(env, sku, fresh = false) {
+  const ck = `labels:photo3:${sku.toLowerCase()}`;
+  const hit = env.TOKEN_KV && !fresh ? await env.TOKEN_KV.get(ck) : null;
   if (hit !== null) return { sku, url: hit || null, cached: true };
   let photo = null;
   const tried = [];
   try {
-    for (const id of [...new Set([sku, labelsBaseSku(sku)])].filter(Boolean)) {
+    // The SKU, then the SKU without its platform name, then (for kits) the first product inside the kit.
+    const queue = [...new Set([sku, labelsBaseSku(sku)])].filter(Boolean);
+    for (let n = 0; n < queue.length && n < 4 && !photo; n++) {
+      const id = queue[n];
       const data = await scGet(env, "/catalog", { SKU: [id], pageNumber: 1, pageSize: 5 });
       const p = (data.Items || []).find((x) => String(x.ID ?? x.ProductID ?? "").toLowerCase() === id.toLowerCase());
       tried.push(id + (p ? "" : " (no product)"));
-      photo = (p && /^https?:\/\//i.test(String(p.ImageUrl || "")) && String(p.ImageUrl)) || null;
+      if (!p) continue;
+      photo = labelsRealPhoto(p.ImageUrl);
       if (photo) break;
       const img = await scGet(env, "/ProductImage", { productID: id }).catch(() => null);
       const list = Array.isArray(img) ? img : img?.Images || img?.Items || [];
-      const pick = list.find((i) => i?.IsDefault && i?.Url) || list.find((i) => i?.Url);
-      photo = pick?.Url && /^https?:\/\//i.test(pick.Url) ? pick.Url : null;
-      if (photo) break;
+      const pick = list.find((i) => i?.IsDefault && labelsRealPhoto(i?.Url)) || list.find((i) => labelsRealPhoto(i?.Url));
+      photo = pick ? labelsRealPhoto(pick.Url) : null;
+      if (!photo && p.IsKit && p.FirstKitChild && !queue.includes(p.FirstKitChild)) queue.push(String(p.FirstKitChild));
     }
   } catch (e) {
     return { sku, url: null, error: String(e?.message || e).slice(0, 200), tried };
