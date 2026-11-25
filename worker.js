@@ -4627,6 +4627,14 @@ async function labelsDiagSc(env, url, request) {
     return [o.OrderSourceOrderID || "", o.ID || "", o.ShippingStatus ?? "", o.StatusCode ?? "", o.OrderSource ?? "", (a.PostalCode || "").trim(), String(o.TimeOfOrder || "").slice(0, 16), o.TrackingNumber || "", (o.AllTrackingNumbers || []).join(","), items.join(";")].join("|");
   };
   if (api === "photo") return Response.json(await labelsPhoto(env, (url.searchParams.get("sku") || "").trim()));
+  if (api === "cat") {
+    const id = (url.searchParams.get("sku") || "").trim();
+    const data = await scGet(env, "/catalog", { SKU: [id], pageNumber: 1, pageSize: 5 });
+    const pickF = (o) => Object.fromEntries(Object.entries(o || {}).filter(([k, v]) => /image|shadow|kit|bundle|parent|^id$|productid|name|upc|type/i.test(k) && v !== null && v !== "" && !(Array.isArray(v) && !v.length)).map(([k, v]) => [k, typeof v === "string" ? v.slice(0, 200) : v]));
+    let prod = null;
+    try { prod = await scGet(env, `/Products/${encodeURIComponent(id)}`, {}); } catch (e) { prod = { error: String(e?.message || e).slice(0, 200) }; }
+    return Response.json({ catalog: (data.Items || []).map(pickF), product: pickF(prod), productKeys: Object.keys(prod || {}).slice(0, 200) });
+  }
   if (api === "day") {
     const day = await labelsCall(env, "/day", { date });
     await labelsAddScSkus(env, day, date);
