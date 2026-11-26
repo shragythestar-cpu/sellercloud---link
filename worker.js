@@ -5798,9 +5798,9 @@ const TEMUSHIP_FILTERS = [
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "lstPicked", FilterPropertyName: "Picked", IsDefaultFilter: false, DependencyFilterIDs: [] },
 ];
 // Shragy's yes (Nov 26): the unshipped Temu orders outside the view that are Processing but not fully picked.
-// Same company, Unshipped and Processing filters as the view, without Fully Picked; temuWant keeps only
+// Company and Unshipped filters only (temuEligible checks Processing); temuWant keeps only
 // not picked (0) and partly picked (1), so the fully picked ones outside the view stay open.
-const TEMUSHIP_OUTSIDE_FILTERS = TEMUSHIP_FILTERS.slice(0, 3);
+const TEMUSHIP_OUTSIDE_FILTERS = TEMUSHIP_FILTERS.slice(0, 2); // with the Processing filter but no Picked one the grid returned only recent orders
 function temuFilters(st) { return st && st.scope === "outside" ? TEMUSHIP_OUTSIDE_FILTERS : TEMUSHIP_FILTERS; }
 function temuWant(o, st) { return temuEligible(o, st.cutoff) && (st.scope !== "outside" || [0, 1].includes(Number(o.Picked))); }
 async function temuListPage(env, cutoff, page, pageSize = 50, desc = false, filters = TEMUSHIP_FILTERS) {
