@@ -6024,7 +6024,7 @@ o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby mont
     st.cutoff = cutoff; st.on = true; st.stopped = null; st.startedAt = st.startedAt || new Date().toISOString();
     st.limit = parseInt(url.searchParams.get("limit") || "0", 10) || 0;
     if (url.searchParams.has("then")) st.then = url.searchParams.get("then") === "label" ? "label" : null;
-    if (url.searchParams.has("mode")) st.mode = url.searchParams.get("mode") === "label" ? "label" : null;
+    if (url.searchParams.has("mode")) { st.mode = url.searchParams.get("mode") === "label" ? "label" : null; st.labelStart = 1; }
     await temuSave(env, st);
     return Response.json(st);
   }
