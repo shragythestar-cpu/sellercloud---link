@@ -86,7 +86,7 @@ The worker can assemble kits in Sellercloud with the same call Sellercloud's own
 
 - **Live-board copy (Nov 24).** Every 5 minutes (cron `*/5 * * * *`) the worker reads the live Production Schedule
   (18410399966, read only) and copies its open productions (group Production Schedule, not Done) to the Hub board
-  18439411777, tagged in "Live board item". Turn on with Text variable `MIRROR_ENABLED` = `yes`; anything else = off.
+  18439411777, tagged in "Live board item". Turn on with Text variable `MIRROR_ENABLED` = `yes`; anything else = off. **Stopped Nov 26** (Shragy): `MIRROR_STOPPED = true` in worker.js keeps it off whatever the variable says; set it to false and push to turn it back on. Copies already in the Hub stay.
   Optional: `MIRROR_SKIP` (comma list of live ids, default 13598232255), `MIRROR_MAX_CALLS` (writes per run, default 350).
   Check it at `GET /mirror/status?key=` (Hub key). Nothing is ever written to the live board.
 - **Label carriers (Nov 24).** Upload `data` takes a batch-level `carrier` (GOFO, UPS, USPS, FedEx, DHL, OnTrac, Amazon

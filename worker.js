@@ -5111,7 +5111,10 @@ const MIRROR_COLS = [
 const MIRROR_ONCE = [[MC.shipmentId, "long_text"], [MC.fbaLocation, "text"]];
 const MIRROR_FILES = ["file_mm2tnx4a", "file_mm2tgk84", "file_mm2t70h5"];
 const MIRROR_EARLY = new Set(["Unassigned", "Assigned", "Queued", "Next Up Manual", "Next Up Machine"]);
-const mirrorOn = (env) => String(env.MIRROR_ENABLED || "").trim().toLowerCase() === "yes";
+// Nov 26: Shragy asked to stop the copy. Off here in the code, whatever MIRROR_ENABLED says in the dashboard (the
+// variable is kept by keep_vars, so a push can't change it). To turn the copy back on: set MIRROR_STOPPED to false and push.
+const MIRROR_STOPPED = true;
+const mirrorOn = (env) => !MIRROR_STOPPED && String(env.MIRROR_ENABLED || "").trim().toLowerCase() === "yes";
 const mirrorSkip = (env) => new Set(String(env.MIRROR_SKIP ?? "13598232255").split(",").map((x) => x.trim()).filter(Boolean));
 
 // Live board: reads only. Refuses anything that isn't a query.
