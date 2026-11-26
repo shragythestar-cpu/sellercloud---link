@@ -5886,7 +5886,7 @@ async function temuShipSome(env, st, max, stopAt) {
   let page = labelMode ? Math.max(1, (st.labelStart || 1) - 1) : 1;
   while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
     // The label pass reads newest first in big pages: labelled orders are recent, the oldest are Freight ones.
-    const { total, items } = await temuListPage(env, st.cutoff, page, labelMode ? 250 : 50, labelMode, temuFilters(st));
+    const { total, items } = await temuListPage(env, st.cutoff, page, labelMode || st.scope === "outside" ? 250 : 50, labelMode, temuFilters(st));
     if (res.left === null) res.left = total;
     if (!items.length) { res.reachedEnd = true; break; }
     if (labelMode && !res.firstOldPage && items.some((o) => temuWant(o, st))) res.firstOldPage = page;
