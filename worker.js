@@ -4870,7 +4870,10 @@ async function scanRoute(request, env, path, url) {
       const date = String(body.date || "").trim();
       if (!isDay(date)) return json({ error: "Add date as YYYY-MM-DD." }, 400);
       const items = Array.isArray(body.items) ? body.items.slice(0, 2000).map((x) => ({ batchId: String(x?.batchId || "").trim(), pkg: String(x?.pkg || "").trim().slice(0, 120) })).filter((x) => x.batchId && x.pkg) : [];
-      const changed = await labelsAside(env, date, items, body.aside !== false);
+      // { listed: true|false } instead of aside moves set-aside labels into (or out of) Today's products as a fixed line.
+      const changed = typeof body.listed === "boolean"
+        ? await labelsAside(env, date, items, body.listed, "listed")
+        : await labelsAside(env, date, items, body.aside !== false);
       return json({ ok: true, changed, checks: await labelsChecks(env, date) });
     }
     case "/labels/upc": {
@@ -5020,9 +5023,9 @@ export class LabelStore {
         let v = c;
         if (!body.raw) {
           const prev = this.sql.exec("SELECT v FROM checks WHERE date = ? AND id = ?", date, c.id).toArray()[0];
-          let pa = false;
-          try { pa = !!(prev && JSON.parse(prev.v).aside); } catch {}
-          v = { ...c, aside: pa && !c.good };
+          let pv = {};
+          try { pv = prev ? JSON.parse(prev.v) : {}; } catch {}
+          v = { ...c, aside: !!pv.aside && !c.good, listed: !!pv.aside && !!pv.listed && !c.good };
         }
         this.sql.exec("INSERT INTO checks (date, id, v) VALUES (?, ?, ?) ON CONFLICT(date, id) DO UPDATE SET v = excluded.v", date, c.id, JSON.stringify(v));
       }
@@ -5037,8 +5040,10 @@ export class LabelStore {
         const row = this.sql.exec("SELECT v FROM checks WHERE date = ? AND id = ?", date, id).toArray()[0];
         if (!row) continue;
         let c; try { c = JSON.parse(row.v); } catch { continue; }
-        if (c.good || !!c.aside === !!body.aside) continue;
-        c.aside = !!body.aside; c.asideAt = at; changed++;
+        // field "listed" (Nov 26): a set-aside label moved back into Today's products as its own fixed line.
+        const f = body.field === "listed" ? "listed" : "aside";
+        if (c.good || !!c[f] === !!body.aside || (f === "listed" && !c.aside)) continue;
+        c[f] = !!body.aside; c[f + "At"] = at; if (f === "aside" && !c.aside) c.listed = false; changed++;
         this.sql.exec("UPDATE checks SET v = ? WHERE date = ? AND id = ?", JSON.stringify(c), date, id);
       }
       return out({ changed });
@@ -5641,9 +5646,9 @@ async function labelsCheckRun(env, date, opts = {}) {
   return { results, partial, unchecked, found: new Set(all.map((p) => p.batchId + "|" + p.pkg)) };
 }
 // Sets aside (or brings back) checked labels that are not good. Returns how many changed.
-async function labelsAside(env, date, items, aside) {
+async function labelsAside(env, date, items, aside, field = "aside") {
   await labelsChecks(env, date);
-  const { changed } = await labelsCall(env, "/checks-aside", { date, aside: !!aside, ids: items.map((x) => x.batchId + "|" + x.pkg) });
+  const { changed } = await labelsCall(env, "/checks-aside", { date, aside: !!aside, field, ids: items.map((x) => x.batchId + "|" + x.pkg) });
   return Number(changed) || 0;
 }
 
