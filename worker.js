@@ -5797,6 +5797,12 @@ const TEMUSHIP_FILTERS = [
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "ddlOrderStatus", FilterPropertyName: "OrderStatus", IsDefaultFilter: true, DependencyFilterIDs: [] },
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "lstPicked", FilterPropertyName: "Picked", IsDefaultFilter: false, DependencyFilterIDs: [] },
 ];
+// Shragy's yes (Nov 26): the unshipped Temu orders outside the view that are Processing but not fully picked.
+// Same company, Unshipped and Processing filters as the view, without Fully Picked; temuWant keeps only
+// not picked (0) and partly picked (1), so the fully picked ones outside the view stay open.
+const TEMUSHIP_OUTSIDE_FILTERS = TEMUSHIP_FILTERS.slice(0, 3);
+function temuFilters(st) { return st && st.scope === "outside" ? TEMUSHIP_OUTSIDE_FILTERS : TEMUSHIP_FILTERS; }
+function temuWant(o, st) { return temuEligible(o, st.cutoff) && (st.scope !== "outside" || [0, 1].includes(Number(o.Picked))); }
 async function temuListPage(env, cutoff, page, pageSize = 50, desc = false, filters = TEMUSHIP_FILTERS) {
   const url = (await deltaBase(env)) + "/api/Manage/ManageEntity/GetGridData";
   const body = { GlobalSearchKeyWord: null, IncludeTotals: true, Key: null, Kind: 1, PageNumber: page, ResultsPerPage: pageSize,
@@ -5880,15 +5886,15 @@ async function temuShipSome(env, st, max, stopAt) {
   let page = labelMode ? Math.max(1, (st.labelStart || 1) - 1) : 1;
   while (res.shipped + res.failed.length < max && Date.now() < stopAt) {
     // The label pass reads newest first in big pages: labelled orders are recent, the oldest are Freight ones.
-    const { total, items } = await temuListPage(env, st.cutoff, page, labelMode ? 250 : 50, labelMode);
+    const { total, items } = await temuListPage(env, st.cutoff, page, labelMode ? 250 : 50, labelMode, temuFilters(st));
     if (res.left === null) res.left = total;
     if (!items.length) { res.reachedEnd = true; break; }
-    if (labelMode && !res.firstOldPage && items.some((o) => temuEligible(o, st.cutoff))) res.firstOldPage = page;
+    if (labelMode && !res.firstOldPage && items.some((o) => temuWant(o, st))) res.firstOldPage = page;
     const want = labelMode
-      ? items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && labelMap.get(poOf(o))?.tracking)
-      : items.filter((o) => temuEligible(o, st.cutoff) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(poOf(o)));
-    res.hasLabel += items.filter((o) => temuEligible(o, st.cutoff) && labelPos.has(poOf(o))).length;
-    if (labelMode) res.labelBad = (res.labelBad || 0) + items.filter((o) => temuEligible(o, st.cutoff) && labelMap.get(poOf(o))?.bad).length;
+      ? items.filter((o) => temuWant(o, st) && !(st.failedIds || []).includes(o.ID) && labelMap.get(poOf(o))?.tracking)
+      : items.filter((o) => temuWant(o, st) && !(st.failedIds || []).includes(o.ID) && !labelPos.has(poOf(o)));
+    res.hasLabel += items.filter((o) => temuWant(o, st) && labelPos.has(poOf(o))).length;
+    if (labelMode) res.labelBad = (res.labelBad || 0) + items.filter((o) => temuWant(o, st) && labelMap.get(poOf(o))?.bad).length;
     res.skipped += items.length - want.length; res.seen += items.length;
     if (!want.length) { page++; if (page > (labelMode ? 90 : 60)) { res.reachedEnd = true; break; } continue; }
     for (let i = 0; i < want.length && res.shipped + res.failed.length < max && Date.now() < stopAt; i += 25) {
@@ -5922,6 +5928,14 @@ function temuMerge(st, res) {
   if (res.left === 0 || (res.seen > 0 && res.shipped === 0 && res.failed.length === 0 && res.skipped === res.seen && (st.mode !== "label" || res.reachedEnd))) { st.on = false; st.stopped = st.stopped || "no more orders before the cutoff"; }
   if (st.mode === "label" && res.firstOldPage) st.labelStart = res.firstOldPage;
   if (st.mode === "label") { st.labelShipped = (st.labelShipped || 0) + res.shipped; st.lastLabelBad = res.labelBad || 0; }
+  // A queued run (start with &after=1) begins once this one's label pass is through.
+  if (!st.on && st.mode === "label" && st.next && st.stopped === "no more orders before the cutoff") {
+    st.runs = [...(st.runs || []), { scope: st.scope || "view", cutoff: st.cutoff, shipped: st.shipped, labelShipped: st.labelShipped || 0, freightDone: st.freightDone || null, at: new Date().toISOString() }].slice(-10);
+    const n = st.next; st.next = null;
+    st.scope = n.scope; st.cutoff = n.cutoff; st.then = "label"; st.mode = null; st.labelStart = 1;
+    st.limit = 0; st.on = true; st.stopped = null; st.failedIds = []; st.nextBase = { shipped: st.shipped, labelShipped: st.labelShipped || 0, at: new Date().toISOString() };
+    return st;
+  }
   // Freight pass done: go on to the orders with a label, with their own tracking (when started with &then=label).
   if (!st.on && st.mode !== "label" && st.then === "label" && st.stopped === "no more orders before the cutoff") {
     st.freightDone = { shipped: st.shipped, at: new Date().toISOString() };
@@ -6005,11 +6019,12 @@ if(j.rows<500||seen>=tot)break;p++;}})();
   if (api === "dry") {
     const page = parseInt(url.searchParams.get("page") || "1", 10) || 1;
     const size = Math.min(500, parseInt(url.searchParams.get("size") || "500", 10) || 500);
-    const { total, items } = await temuListPage(env, cutoff, page, size);
+    const dst = { cutoff, scope: url.searchParams.get("scope") === "outside" ? "outside" : null };
+    const { total, items } = await temuListPage(env, cutoff, page, size, false, temuFilters(dst));
     const days = {}; let elig = 0; const why = {};
     for (const o of items) {
-      if (temuEligible(o, cutoff)) { elig++; const d = temuNyDay(o.TimeOfOrder).slice(0, 7); days[d] = (days[d] || 0) + 1; }
-      else { const k = [o.CompanyID, o.ShippingStatus, o.StatusCode, temuNyDay(o.TimeOfOrder) < cutoff ? "old" : "new"].join("/"); why[k] = (why[k] || 0) + 1; }
+      if (temuWant(o, dst)) { elig++; const d = temuNyDay(o.TimeOfOrder).slice(0, 7); days[d] = (days[d] || 0) + 1; }
+      else { const k = [o.CompanyID, o.ShippingStatus, o.StatusCode, "picked" + o.Picked, temuNyDay(o.TimeOfOrder) < cutoff ? "old" : "new"].join("/"); why[k] = (why[k] || 0) + 1; }
     }
     return Response.json({ total, page, size, rows: items.length, eligible: elig, byMonth: days, notEligible: why });
   }
@@ -6036,14 +6051,20 @@ o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby mont
     const st = (await temuState(env)) || { cutoff, shipped: 0, failed: [], failedIds: [] };
     if (st.on) return Response.json({ error: "The background run is on; stop it first." }, { status: 409 });
     st.cutoff = cutoff;
-    const keep = st.mode || null;
+    const keep = st.mode || null, keepScope = st.scope || null;
+    if (url.searchParams.has("scope")) st.scope = url.searchParams.get("scope") === "outside" ? "outside" : null;
     if (url.searchParams.get("mode") === "label") { st.mode = "label"; if (url.searchParams.get("page")) st.labelStart = parseInt(url.searchParams.get("page"), 10) || st.labelStart; }
     const res = await temuShipSome(env, st, n, Date.now() + 20_000);
-    temuMerge(st, res); st.on = false; st.mode = keep; await temuSave(env, st);
+    temuMerge(st, res); st.on = false; st.mode = keep; st.scope = keepScope; await temuSave(env, st);
     return Response.json({ res, state: st });
   }
   if (api === "start") {
     const st = (await temuState(env)) || { shipped: 0, failed: [], failedIds: [] };
+    const scope = url.searchParams.get("scope") === "outside" ? "outside" : null;
+    if (url.searchParams.get("after") === "1" && st.on) { // queue it behind the run that is going now
+      st.next = { scope, cutoff }; await temuSave(env, st); return Response.json(st);
+    }
+    if (url.searchParams.has("scope")) st.scope = scope;
     st.cutoff = cutoff; st.on = true; st.stopped = null; st.startedAt = st.startedAt || new Date().toISOString();
     st.limit = parseInt(url.searchParams.get("limit") || "0", 10) || 0;
     if (url.searchParams.has("then")) st.then = url.searchParams.get("then") === "label" ? "label" : null;
