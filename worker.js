@@ -5843,7 +5843,7 @@ async function temuLabelPos(env) {
 // Temu order -> its label's tracking, from the same 30 days of label files. Only an order with exactly one
 // tracking number across its labels gets one; anything else is left alone ("bad").
 async function temuLabelMap(env) {
-  const ck = "temuship:labelmap";
+  const ck = "temuship:labelmap:v2";
   const hit = env.TOKEN_KV ? await env.TOKEN_KV.get(ck, "json").catch(() => null) : null;
   if (hit && Date.now() - hit.at < 10 * 60_000) return new Map(Object.entries(hit.map));
   const acc = new Map();
@@ -5858,8 +5858,15 @@ async function temuLabelMap(env) {
       acc.set(po, a);
     }
   }
+  // Labels the FBM check set aside (wrong product, mixed box, or another problem) keep their order open here.
+  const flagged = new Map();
+  for (let d = 0; d < 30; d++) {
+    const date = new Date(Date.now() - d * 86400_000).toLocaleDateString("en-CA", { timeZone: "America/New_York" });
+    const chk = await labelsChecks(env, date);
+    for (const r of Object.values(chk || {})) if (r && r.po && ["wrong", "mixed", "other"].includes(r.kind)) flagged.set(String(r.po).trim(), r.kind);
+  }
   const map = {};
-  for (const [po, a] of acc) map[po] = a.tr.size === 1 ? { tracking: [...a.tr][0], carrier: a.carrier || "Other", service: a.service || a.carrier || "Other" } : { bad: a.tr.size ? "several tracking numbers" : "no tracking on the label" };
+  for (const [po, a] of acc) map[po] = flagged.has(po) ? { bad: "label check: " + flagged.get(po) } : a.tr.size === 1 ? { tracking: [...a.tr][0], carrier: a.carrier || "Other", service: a.service || a.carrier || "Other" } : { bad: a.tr.size ? "several tracking numbers" : "no tracking on the label" };
   if (env.TOKEN_KV) await env.TOKEN_KV.put(ck, JSON.stringify({ at: Date.now(), map }), { expirationTtl: 3600 }).catch(() => {});
   return new Map(Object.entries(map));
 }
