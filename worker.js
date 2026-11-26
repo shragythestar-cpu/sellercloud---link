@@ -4922,6 +4922,8 @@ export class LabelStore {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS printed (batch_id TEXT NOT NULL, pkg TEXT NOT NULL, printed_at TEXT, by TEXT, times INTEGER DEFAULT 1,
       PRIMARY KEY (batch_id, pkg))`);
     this.sql.exec("CREATE TABLE IF NOT EXISTS upc_links (upc TEXT NOT NULL, sku TEXT NOT NULL, by TEXT, at TEXT, PRIMARY KEY (upc, sku))");
+    // Label checks (Nov 26): one row per checked package, so several Checks running at once never overwrite each other.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS checks (date TEXT NOT NULL, id TEXT NOT NULL, v TEXT NOT NULL, PRIMARY KEY (date, id))");
   }
   lineRow(l) {
     return { sku: l.sku, productName: l.product_name, qty: l.qty, carrier: l.carrier, service: l.service, tracking: l.tracking, cost: l.cost, orderId: l.order_id, page: l.page };
@@ -5002,6 +5004,44 @@ export class LabelStore {
       }
       const links = this.sql.exec("SELECT upc, sku FROM upc_links").toArray();
       return out({ date: body.date, batches, printed, links });
+    }
+    if (path === "/checks-get") {
+      const checks = {};
+      for (const r of this.sql.exec("SELECT id, v FROM checks WHERE date = ?", String(body.date || "")).toArray()) {
+        try { checks[r.id] = JSON.parse(r.v); } catch {}
+      }
+      return out({ checks });
+    }
+    if (path === "/checks-put") {
+      // raw: write as given. Otherwise keep a stored "aside" while the new result is still not good.
+      const date = String(body.date || "");
+      for (const c of body.items || []) {
+        if (!c || !c.id) continue;
+        let v = c;
+        if (!body.raw) {
+          const prev = this.sql.exec("SELECT v FROM checks WHERE date = ? AND id = ?", date, c.id).toArray()[0];
+          let pa = false;
+          try { pa = !!(prev && JSON.parse(prev.v).aside); } catch {}
+          v = { ...c, aside: pa && !c.good };
+        }
+        this.sql.exec("INSERT INTO checks (date, id, v) VALUES (?, ?, ?) ON CONFLICT(date, id) DO UPDATE SET v = excluded.v", date, c.id, JSON.stringify(v));
+      }
+      const old = new Date(Date.now() - 45 * 86400000).toISOString().slice(0, 10);
+      this.sql.exec("DELETE FROM checks WHERE date < ?", old);
+      return out({ ok: true });
+    }
+    if (path === "/checks-aside") {
+      const date = String(body.date || ""); const at = new Date().toISOString();
+      let changed = 0;
+      for (const id of body.ids || []) {
+        const row = this.sql.exec("SELECT v FROM checks WHERE date = ? AND id = ?", date, id).toArray()[0];
+        if (!row) continue;
+        let c; try { c = JSON.parse(row.v); } catch { continue; }
+        if (c.good || !!c.aside === !!body.aside) continue;
+        c.aside = !!body.aside; c.asideAt = at; changed++;
+        this.sql.exec("UPDATE checks SET v = ? WHERE date = ? AND id = ?", JSON.stringify(c), date, id);
+      }
+      return out({ changed });
     }
     if (path === "/printed") {
       const at = new Date().toISOString();
@@ -5439,8 +5479,20 @@ function labelsPackages(batch) {
   }
   return by;
 }
+// Nov 26: checks live in the LABELS store (one row each). Checks from before that sat in one KV blob; they are moved over
+// the first time their day is read.
 async function labelsChecks(env, date) {
-  try { return (env.TOKEN_KV && (await env.TOKEN_KV.get(LCHK_KEY(date), "json"))) || {}; } catch { return {}; }
+  try {
+    const { checks } = await labelsCall(env, "/checks-get", { date });
+    if (checks && Object.keys(checks).length) return checks;
+    const old = (env.TOKEN_KV && (await env.TOKEN_KV.get(LCHK_KEY(date), "json"))) || {};
+    const items = Object.values(old).filter((c) => c && c.id);
+    if (items.length) {
+      await labelsCall(env, "/checks-put", { date, raw: true, items });
+      await env.TOKEN_KV.delete(LCHK_KEY(date)).catch(() => {});
+    }
+    return old;
+  } catch { return {}; }
 }
 // opts: { want: [{batchId,pkg}] | null (all), batchId, onlyNew }. Returns { results, partial, unchecked (ids), found (ids) }.
 async function labelsCheckRun(env, date, opts = {}) {
@@ -5575,14 +5627,11 @@ async function labelsCheckRun(env, date, opts = {}) {
     if (r.good) r.kind = r.shipped ? "shipped" : "good";
     results.push(r);
   }
+  if (results.length) {
+    await labelsChecks(env, date); // moves an older KV blob over first, so its "aside" marks are kept
+    await labelsCall(env, "/checks-put", { date, items: results.map(({ scId, carrier, service, ...keep }) => keep) }).catch(() => {});
+  }
   if (env.TOKEN_KV) {
-    const fresh = await labelsChecks(env, date);
-    for (const r of results) {
-      const prev = fresh[r.id];
-      const { scId, carrier, service, ...keep } = r;
-      fresh[r.id] = { ...keep, aside: !!(prev && prev.aside && !r.good) };
-    }
-    await env.TOKEN_KV.put(LCHK_KEY(date), JSON.stringify(fresh), { expirationTtl: 45 * 86400 }).catch(() => {});
     if (namesChanged) {
       const keys = Object.keys(names);
       if (keys.length > 4000) for (const k of keys.slice(0, keys.length - 4000)) delete names[k];
@@ -5593,16 +5642,9 @@ async function labelsCheckRun(env, date, opts = {}) {
 }
 // Sets aside (or brings back) checked labels that are not good. Returns how many changed.
 async function labelsAside(env, date, items, aside) {
-  const fresh = await labelsChecks(env, date);
-  let changed = 0;
-  for (const x of items) {
-    const id = x.batchId + "|" + x.pkg;
-    const c = fresh[id];
-    if (!c || c.good) continue;
-    if (!!c.aside !== aside) { c.aside = aside; c.asideAt = new Date().toISOString(); changed++; }
-  }
-  if (changed && env.TOKEN_KV) await env.TOKEN_KV.put(LCHK_KEY(date), JSON.stringify(fresh), { expirationTtl: 45 * 86400 });
-  return changed;
+  await labelsChecks(env, date);
+  const { changed } = await labelsCall(env, "/checks-aside", { date, aside: !!aside, ids: items.map((x) => x.batchId + "|" + x.pkg) });
+  return Number(changed) || 0;
 }
 
 // ── Labels auto mark shipped (Nov 25, Shragy's ask): when the Hub marks a Temu label printed, mark that order shipped in
