@@ -5525,7 +5525,9 @@ async function labelsCheckRun(env, date, opts = {}) {
     if (!orders.length) other("no Temu order number on this label");
     else if (orders.length > 1) other("one label for " + orders.length + " orders");
     const o = orders.length === 1 ? sc.get(orders[0]) : null;
-    if (orders.length === 1 && !o) other("Temu order not found in Sellercloud");
+    // Nov 26 (Shragy): an order Sellercloud doesn't have yet is not a bad label; it prints normally and auto mark
+    // shipped skips it (nothing to mark). r.notInSc tells the two apart.
+    if (orders.length === 1 && !o) r.notInSc = true;
     if (o) {
       r.scId = o.ID;
       r.items = itemsOf(o);
@@ -5646,6 +5648,7 @@ async function autoshipPlan(env, pkgs) {
       const r = got.get(id);
       if (!r) { out.push(later.has(id) ? { ...p, skip: "not checked yet", retry: true } : { ...p, skip: found.has(id) ? "not checked" : "label not found in the day's file" }); continue; }
       if (r.shipped) { out.push({ ...p, po: r.po, skip: "already shipped in Sellercloud" }); continue; }
+      if (r.good && !r.scId) { out.push({ ...p, po: r.po, skip: "order not in Sellercloud" }); continue; }
       // A wrong-product or mixed label that was set aside is printed from Needs fixing with a packing slip built from
       // Sellercloud, so the box holds what the order holds: that one may ship. Anything else not good does not.
       const fixed = (r.kind === "wrong" || r.kind === "mixed") && !!stored[id]?.aside;
