@@ -5528,16 +5528,12 @@ async function labelsCheckRun(env, date, opts = {}) {
     if (o) {
       r.scId = o.ID;
       r.items = itemsOf(o);
-      const have = [o.TrackingNumber, ...(o.AllTrackingNumbers || [])].map(autoshipNorm).filter(Boolean);
-      const mine = tracks.length === 1 ? tracks[0] : "";
       if (Number(o.CompanyID) !== TEMUSHIP_COMPANY) other("not a Temu order in Sellercloud");
-      if (!temuUnshipped(o.ShippingStatus)) {
-        if (mine && have.includes(mine)) r.shipped = true;
-        else other("already marked shipped in Sellercloud " + (have.length ? "with another tracking number" : "with no tracking"));
-      } else {
-        if (have.some((h) => h !== mine)) other("Sellercloud already has another tracking number");
-        if (!temuProcessing(o.StatusCode)) other("Sellercloud order status is " + o.StatusCode + ", not Processing");
-      }
+      // Nov 26 (Shragy): whether Sellercloud already shows the order shipped doesn't matter here, because Sellercloud
+      // isn't connected to Temu. The check is about the box holding the right product and qty. An order already
+      // shipped in Sellercloud is still good when its product and qty match; auto mark shipped just leaves it alone.
+      if (!temuUnshipped(o.ShippingStatus)) r.shipped = true;
+      if (o.StatusCode === -1 || /cancel/i.test(String(o.StatusCode))) other("the order is cancelled in Sellercloud");
       if ((perOrder.get(orders[0]) || 0) > 1) other("this order has " + perOrder.get(orders[0]) + " labels today");
       if (r.items.length > 1) {
         r.reasons.push("mixed order: " + r.items.length + " different products in one box, pack by hand");
@@ -5648,7 +5644,7 @@ async function autoshipPlan(env, pkgs) {
       const id = p.batchId + "|" + p.pkg;
       const r = got.get(id);
       if (!r) { out.push(later.has(id) ? { ...p, skip: "not checked yet", retry: true } : { ...p, skip: found.has(id) ? "not checked" : "label not found in the day's file" }); continue; }
-      if (r.shipped) { out.push({ ...p, po: r.po, skip: "already shipped in Sellercloud with this label" }); continue; }
+      if (r.shipped) { out.push({ ...p, po: r.po, skip: "already shipped in Sellercloud" }); continue; }
       // A wrong-product or mixed label that was set aside is printed from Needs fixing with a packing slip built from
       // Sellercloud, so the box holds what the order holds: that one may ship. Anything else not good does not.
       const fixed = (r.kind === "wrong" || r.kind === "mixed") && !!stored[id]?.aside;
