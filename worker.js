@@ -6053,6 +6053,7 @@ o.textContent='DRY page '+p+' rows '+rows+' of '+tot+' eligible '+el+'\\nby mont
     st.cutoff = cutoff;
     const keep = st.mode || null, keepScope = st.scope || null;
     if (url.searchParams.has("scope")) st.scope = url.searchParams.get("scope") === "outside" ? "outside" : null;
+    if (url.searchParams.get("mode") === "freight") st.mode = null;
     if (url.searchParams.get("mode") === "label") { st.mode = "label"; if (url.searchParams.get("page")) st.labelStart = parseInt(url.searchParams.get("page"), 10) || st.labelStart; }
     const res = await temuShipSome(env, st, n, Date.now() + 20_000);
     temuMerge(st, res); st.on = false; st.mode = keep; st.scope = keepScope; await temuSave(env, st);
