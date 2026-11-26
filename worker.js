@@ -4871,7 +4871,9 @@ async function scanRoute(request, env, path, url) {
       if (!isDay(date)) return json({ error: "Add date as YYYY-MM-DD." }, 400);
       const items = Array.isArray(body.items) ? body.items.slice(0, 2000).map((x) => ({ batchId: String(x?.batchId || "").trim(), pkg: String(x?.pkg || "").trim().slice(0, 120) })).filter((x) => x.batchId && x.pkg) : [];
       // { listed: true|false } instead of aside moves set-aside labels into (or out of) Today's products as a fixed line.
-      const changed = typeof body.listed === "boolean"
+      const changed = typeof body.fixed === "boolean"
+        ? await labelsAside(env, date, items, body.fixed, "fixed")
+        : typeof body.listed === "boolean"
         ? await labelsAside(env, date, items, body.listed, "listed")
         : await labelsAside(env, date, items, body.aside !== false);
       return json({ ok: true, changed, checks: await labelsChecks(env, date) });
@@ -5025,7 +5027,8 @@ export class LabelStore {
           const prev = this.sql.exec("SELECT v FROM checks WHERE date = ? AND id = ?", date, c.id).toArray()[0];
           let pv = {};
           try { pv = prev ? JSON.parse(prev.v) : {}; } catch {}
-          v = { ...c, aside: !!pv.aside && !c.good, listed: !!pv.aside && !!pv.listed && !c.good };
+          v = { ...c, aside: !!pv.aside && !c.good, listed: !!pv.aside && !!pv.listed && !c.good,
+            fixed: !!pv.fixed && !c.good && c.kind === "wrong" && (c.items || []).length === 1 };
         }
         this.sql.exec("INSERT INTO checks (date, id, v) VALUES (?, ?, ?) ON CONFLICT(date, id) DO UPDATE SET v = excluded.v", date, c.id, JSON.stringify(v));
       }
@@ -5041,9 +5044,16 @@ export class LabelStore {
         if (!row) continue;
         let c; try { c = JSON.parse(row.v); } catch { continue; }
         // field "listed" (Nov 26): a set-aside label moved back into Today's products as its own fixed line.
-        const f = body.field === "listed" ? "listed" : "aside";
+        // field "fixed" (Nov 26): a wrong-product / wrong-qty label moved onto the line of what Sellercloud says the order
+        // holds (one product only). Fixing takes it out of Needs fixing.
+        const f = body.field === "listed" ? "listed" : body.field === "fixed" ? "fixed" : "aside";
         if (c.good || !!c[f] === !!body.aside || (f === "listed" && !c.aside)) continue;
-        c[f] = !!body.aside; c[f + "At"] = at; if (f === "aside" && !c.aside) c.listed = false; changed++;
+        if (f === "fixed" && body.aside && !(c.kind === "wrong" && (c.items || []).length === 1)) continue;
+        c[f] = !!body.aside; c[f + "At"] = at;
+        if (f === "aside" && !c.aside) c.listed = false;
+        if (f === "aside" && c.aside) c.fixed = false;
+        if (f === "fixed" && c.fixed) { c.aside = false; c.listed = false; }
+        changed++;
         this.sql.exec("UPDATE checks SET v = ? WHERE date = ? AND id = ?", JSON.stringify(c), date, id);
       }
       return out({ changed });
@@ -5698,7 +5708,7 @@ async function autoshipPlan(env, pkgs) {
       if (r.good && !r.scId) { out.push({ ...p, po: r.po, skip: "order not in Sellercloud" }); continue; }
       // A wrong-product or mixed label that was set aside is printed from Needs fixing with a packing slip built from
       // Sellercloud, so the box holds what the order holds: that one may ship. Anything else not good does not.
-      const fixed = (r.kind === "wrong" || r.kind === "mixed") && !!stored[id]?.aside;
+      const fixed = (r.kind === "wrong" || r.kind === "mixed") && (!!stored[id]?.aside || (r.kind === "wrong" && !!stored[id]?.fixed));
       if (!r.good && !fixed) { out.push({ ...p, po: r.po, skip: "check: " + r.reasons.join("; ") }); continue; }
       out.push({ ...p, po: r.po, tracking: r.tracking, carrier: r.carrier, service: r.service, scId: r.scId, items: r.items.map((i) => i.sku + " x" + i.qty).join(" + ") });
     }
