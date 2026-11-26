@@ -5797,10 +5797,10 @@ const TEMUSHIP_FILTERS = [
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "ddlOrderStatus", FilterPropertyName: "OrderStatus", IsDefaultFilter: true, DependencyFilterIDs: [] },
   { FilterSelectedValues: ["2"], HasValue: true, FilterId: "lstPicked", FilterPropertyName: "Picked", IsDefaultFilter: false, DependencyFilterIDs: [] },
 ];
-async function temuListPage(env, cutoff, page, pageSize = 50, desc = false) {
+async function temuListPage(env, cutoff, page, pageSize = 50, desc = false, filters = TEMUSHIP_FILTERS) {
   const url = (await deltaBase(env)) + "/api/Manage/ManageEntity/GetGridData";
   const body = { GlobalSearchKeyWord: null, IncludeTotals: true, Key: null, Kind: 1, PageNumber: page, ResultsPerPage: pageSize,
-    SelectedFilters: TEMUSHIP_FILTERS, SortColumn: "ID", SortDirection: !desc, ExcludeGridData: false, ...temuExtra };
+    SelectedFilters: filters, SortColumn: "ID", SortDirection: !desc, ExcludeGridData: false, ...temuExtra };
   for (let attempt = 0; attempt < 5; attempt++) {
     await waitIfBusy();
     const token = await deltaGetToken(env);
@@ -5971,6 +5971,29 @@ async function temuBacklogRoute(env, url) {
       out.checked = Math.min(pos.length, i + 25);
     }
     return Response.json(out);
+  }
+  if (api === "outside") {
+    // Read only: every unshipped Temu order (company and Unshipped filters only), tallied by order status,
+    // picked state and New York month, so the orders outside the TEMU Shipping view can be counted.
+    const page = parseInt(url.searchParams.get("page") || "1", 10) || 1;
+    const size = Math.min(500, parseInt(url.searchParams.get("size") || "500", 10) || 500);
+    const { total, items } = await temuListPage(env, cutoff, page, size, false, TEMUSHIP_FILTERS.slice(0, 2));
+    const tally = {};
+    for (const o of items) {
+      const k = ["status" + o.StatusCode, "picked" + o.Picked, temuNyDay(o.TimeOfOrder || o.CreatedOn).slice(0, 7), /^PO-211-/.test(String(o.OrderSourceOrderID || "")) ? "po" : "nopo"].join("/");
+      tally[k] = (tally[k] || 0) + 1;
+    }
+    return Response.json({ total, page, size, rows: items.length, tally });
+  }
+  if (api === "outsidepage") {
+    return new Response(`<!doctype html><title>outside</title><pre id=o>working</pre><script>
+(async()=>{const T=${JSON.stringify(t)};let p=1,seen=0,tot=0;const all={};
+for(;;){let j;try{j=await (await fetch('?t='+T+'&api=outside&size=500&page='+p)).json();}catch(e){await new Promise(r=>setTimeout(r,3000));continue;}
+if(j.error){document.getElementById('o').textContent='ERROR '+JSON.stringify(j);return;}
+tot=j.total;seen+=j.rows;for(const k in j.tally)all[k]=(all[k]||0)+j.tally[k];
+document.getElementById('o').textContent=(j.rows<500||seen>=tot?'DONE ':'')+'seen '+seen+' of '+tot+'\n'+Object.entries(all).sort().map(e=>e[0]+' '+e[1]).join('\n');
+if(j.rows<500||seen>=tot)break;p++;}})();
+</script>`, { headers: { "content-type": "text/html" } });
   }
   if (api === "whoami") return Response.json({ sellercloudUser: env.SC_USERNAME || null });
   if (api === "reset") { const st = (await temuState(env)) || {}; if (st.on) return Response.json({ error: "stop the run first" }, { status: 409 }); st.failed = []; st.failedIds = []; await temuSave(env, st); return Response.json(st); }
