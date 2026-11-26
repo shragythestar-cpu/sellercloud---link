@@ -5458,6 +5458,7 @@ async function labelsCheckRun(env, date, opts = {}) {
   const wantSet = opts.want ? new Set(opts.want.map((x) => x.batchId + "|" + x.pkg)) : null;
   let todo = all.filter((p) => (!wantSet || wantSet.has(p.batchId + "|" + p.pkg)) && (!opts.batchId || p.batchId === opts.batchId));
   if (opts.onlyNew) todo = todo.filter((p) => !stored[p.batchId + "|" + p.pkg]);
+  if (opts.title) todo = todo.filter((p) => !p.lines.some((l) => labelsTitle(l.sku) !== labelsTitle(p.lines[0]?.sku)) && String(p.lines[0]?.productName || p.lines[0]?.sku || "").toLowerCase().includes(opts.title.toLowerCase()));
   const ids = [...new Set(todo.flatMap((p) => p.lines.map((l) => String(l.orderId || "").trim())).filter(Boolean))];
   const sc = new Map(); const asked = new Set(); let partial = false;
   for (let i = 0; i < ids.length; i += 25) {
@@ -5721,11 +5722,13 @@ async function autoshipRoute(env, url) {
     // Read only: run the labels check for a day (optionally one batch, optionally only labels not checked yet).
     const date = (url.searchParams.get("date") || "").trim();
     if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
-    const r = await labelsCheckRun(env, date, { batchId: url.searchParams.get("batch") || "", onlyNew: url.searchParams.get("new") === "1" });
+    const r = await labelsCheckRun(env, date, { batchId: url.searchParams.get("batch") || "", onlyNew: url.searchParams.get("new") === "1", title: (url.searchParams.get("title") || "").trim().slice(0, 80) });
     const stored = await labelsChecks(env, date);
     const vals = Object.values(stored);
     const count = (f) => vals.filter(f).length;
-    return Response.json({ ran: r.results.length, partial: r.partial, unchecked: r.unchecked.length,
+    const ranGood = r.results.filter((x) => x.good);
+    return Response.json({ ran: r.results.length, ranGood: ranGood.length, ranShipped: r.results.filter((x) => x.shipped).length, partial: r.partial, unchecked: r.unchecked.length,
+      ranBad: url.searchParams.get("title") ? r.results.filter((x) => !x.good).map((x) => [x.po, x.kind, x.reasons.join(" / ").slice(0, 160)]) : undefined,
       stored: { total: vals.length, good: count((x) => x.good), notGood: count((x) => !x.good), wrong: count((x) => x.kind === "wrong"), mixed: count((x) => x.kind === "mixed"), other: count((x) => x.kind === "other"), shipped: count((x) => x.shipped) },
       bad: url.searchParams.get("list") === "1" ? vals.filter((x) => !x.good).map((x) => [x.id, x.po, x.kind, x.reasons.join(" / ").slice(0, 160), x.items.map((i) => i.sku + " x" + i.qty).join(" + ")]) : undefined });
   }
