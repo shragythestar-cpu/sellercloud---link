@@ -5956,6 +5956,14 @@ async function autoshipRoute(env, url) {
     const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
     return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
   }
+  if (api === "product") {
+    // Read only: Sellercloud catalog products whose SKU or name has &q= (up to 50), with their short fields.
+    const q = (url.searchParams.get("q") || "").trim();
+    if (!q) return Response.json({ error: "add &q=" }, { status: 400 });
+    const data = await scGet(env, "/catalog", { Keyword: q, pageNumber: 1, pageSize: 50 });
+    const items = (data?.Items || []).map((x) => Object.fromEntries(Object.entries(x).filter(([k, v]) => v !== null && v !== "" && v !== 0 && v !== false && (typeof v !== "object" || (Array.isArray(v) && v.length)) && String(JSON.stringify(v)).length < 300 && /id$|sku|name|title|kit|qty|quantity|pack|upc|weight|size|desc|alias|child|parent|component/i.test(k))));
+    return Response.json({ n: items.length, items });
+  }
   if (api === "lookup") {
     // Read only: what Sellercloud holds now for some Temu orders (&pos=PO-1,PO-2, up to 25).
     const pos = (url.searchParams.get("pos") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 25);
