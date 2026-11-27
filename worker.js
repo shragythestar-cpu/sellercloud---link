@@ -4938,7 +4938,7 @@ async function scanRoute(request, env, path, url) {
       if (!isDay(date) || !title || !sku) return json({ error: "date, title and sku are needed." }, 400);
       const stored = await labelsChecks(env, date);
       const mine = Object.values(stored).filter((x) => labelsTitle(x.title) === title.slice(0, 200));
-      const offered = new Set(mine.filter((x) => x.items && x.items.length === 1 && lRealSku(x.items[0].sku)).map((x) => x.items[0].sku));
+      const offered = new Set(mine.filter((x) => !x.pos && x.items && x.items.length === 1 && lRealSku(x.items[0].sku)).map((x) => x.items[0].sku));
       if (!offered.has(sku)) return json({ error: "Sellercloud doesn't show that SKU for this line's orders." }, 400);
       let map = {};
       try { map = JSON.parse((env.TOKEN_KV && (await env.TOKEN_KV.get(LABELS_TITLE_KEY))) || "{}") || {}; } catch { map = {}; }
@@ -5595,7 +5595,7 @@ function labelsLineRules(list, ctx, out = {}) {
   const lineKey = (x) => String(x.batchId || "") + "|" + labelsTitle(x.title);
   const byLine = new Map(), names = new Map(), skuName = new Map();
   for (const x of ctx || []) {
-    if (!x || lRealSku(x.labelSku) || x.notInSc || !x.items || x.items.length !== 1 || !lRealSku(x.items[0].sku)) continue;
+    if (!x || lRealSku(x.labelSku) || x.notInSc || x.pos || !x.items || x.items.length !== 1 || !lRealSku(x.items[0].sku)) continue;
     const k = lineKey(x);
     if (!byLine.has(k)) byLine.set(k, new Map());
     const m = byLine.get(k);
@@ -5617,7 +5617,7 @@ function labelsLineRules(list, ctx, out = {}) {
   }
   for (const x of list) {
     if (!x || !x.good) continue;
-    if (x.notInSc) continue;
+    if (x.notInSc || x.pos) continue;
     if (!x.items || x.items.length !== 1) continue;
     const sku = x.items[0].sku;
     if (!lRealSku(sku)) {
