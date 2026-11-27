@@ -5790,6 +5790,7 @@ async function autoshipRoute(env, url) {
     return Response.json({ ran: r.results.length, ranGood: ranGood.length, ranShipped: r.results.filter((x) => x.shipped).length, partial: r.partial, unchecked: r.unchecked.length,
       ranBad: url.searchParams.get("title") ? r.results.filter((x) => !x.good).map((x) => [x.po, x.kind, x.reasons.join(" / ").slice(0, 160)]) : undefined,
       stored: { total: vals.length, good: count((x) => x.good), notGood: count((x) => !x.good), wrong: count((x) => x.kind === "wrong"), mixed: count((x) => x.kind === "mixed"), other: count((x) => x.kind === "other"), shipped: count((x) => x.shipped) },
+      notInSc: url.searchParams.get("list") === "1" ? vals.filter((x) => x.notInSc).map((x) => [x.id, x.po, x.good, x.kind, String(x.title || "").slice(0, 60), x.labelQty]) : undefined,
       bad: url.searchParams.get("list") === "1" ? vals.filter((x) => !x.good).map((x) => [x.id, x.po, x.kind, x.reasons.join(" / ").slice(0, 160), x.items.map((i) => i.sku + " x" + i.qty).join(" + ")]) : undefined });
   }
   return Response.json({ error: "api must be status, preview, ship1, check, on or off" }, { status: 400 });
