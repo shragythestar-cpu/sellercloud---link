@@ -5517,31 +5517,20 @@ async function labelsChecks(env, date) {
 //   on a tie) are on the wrong line. Orders Sellercloud doesn't have stay as Shragy set on Nov 26.
 const lRealSku = (x) => !!x && String(x).trim().toUpperCase() !== "UNKNOWN";
 function labelsLineRules(list, ctx) {
-  const groups = new Map();
-  for (const x of ctx) {
-    if (!x || !x.items || x.items.length !== 1 || lRealSku(x.labelSku) || !lRealSku(x.items[0].sku)) continue;
-    const k = labelsTitle(x.title);
-    const m = groups.get(k) || new Map();
-    m.set(x.items[0].sku, (m.get(x.items[0].sku) || 0) + 1);
-    groups.set(k, m);
-  }
+  // Nov 27 (Shragy): "dont say good when you dont really know". Good needs Sellercloud to confirm the line's own SKU.
   const changed = [];
+  const unsure = (x, why) => { Object.assign(x, { good: false, kind: "unconfirmed", reasons: [why] }); changed.push(x); };
   for (const x of list) {
-    if (!x || !x.good || !x.items || x.items.length !== 1) continue;
+    if (!x || !x.good) continue;
+    if (x.notInSc) { unsure(x, "can't confirm: Sellercloud doesn't have this order"); continue; }
+    if (!x.items || x.items.length !== 1) continue;
     const sku = x.items[0].sku;
-    if (!lRealSku(sku)) {
-      // No SKU in Sellercloud: its product name must be the line's product (the title on top of the line).
-      if (lSame(x.title, x.items[0].name) || lOverlap(x.title, x.items[0].name) >= 0.7) continue;
-      Object.assign(x, { good: false, kind: "other", reasons: [`wrong line: Sellercloud has no SKU for this order and its product is "${lShort(x.items[0].name || "unknown")}", not this line's product; set it aside`] });
-      changed.push(x); continue;
+    if (!lRealSku(sku)) { unsure(x, `can't confirm: Sellercloud has no SKU for this order's product ("${lShort(x.items[0].name || "unknown")}")`); continue; }
+    if (!lRealSku(x.labelSku)) { unsure(x, `can't confirm: this line isn't linked to a Sellercloud SKU (Sellercloud has ${sku} for this order)`); continue; }
+    if (x.labelSku !== sku) {
+      Object.assign(x, { good: false, kind: "wrong", reasons: [`wrong line: this line is ${x.labelSku} but Sellercloud has ${sku} for this order`] });
+      changed.push(x);
     }
-    if (lRealSku(x.labelSku)) continue;
-    const m = groups.get(labelsTitle(x.title));
-    if (!m || m.size < 2) continue;
-    const top = [...m].sort((a, b) => b[1] - a[1]);
-    if (top[0][1] > top[1][1] && sku === top[0][0]) continue;
-    Object.assign(x, { good: false, kind: "wrong", reasons: [`wrong line: this line holds ${m.size} different products in Sellercloud (most are ${top[0][0]}); this order is ${sku}`] });
-    changed.push(x);
   }
   return changed;
 }
