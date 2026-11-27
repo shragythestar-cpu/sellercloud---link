@@ -5614,7 +5614,16 @@ async function labelsCheckRun(env, date, opts = {}) {
           r.reasons.push("the label lists " + labelSkus.length + " products but Sellercloud has only " + it.sku);
           if (!r.kind) r.kind = "wrong";
         } else {
-          let ok = lSame(title, it.name);
+          // Nov 27 (Shragy): the label must also sit under the right packing slip. A label carries only the listing
+          // title, and Temu variants (1 vs 2 bars, 3 vs 6 pack, 16 vs 32 oz) share one title, so the line (and its slip)
+          // is the SKU learned for that title. When Sellercloud's SKU is a different one, the label is on the wrong line.
+          const rowSku = r.labelSku && r.labelSku !== "UNKNOWN" ? r.labelSku : "";
+          let ok = rowSku ? rowSku === it.sku : lSame(title, it.name);
+          if (rowSku && !ok) {
+            r.reasons.push(`wrong line: this line is ${rowSku} but Sellercloud has ${it.sku} for this order`);
+            if (!r.kind) r.kind = "wrong";
+            ok = true; // reason already given
+          }
           if (!ok) {
             const s = skusForTitle(labelsTitle(title));
             if (s.size) ok = s.has(it.sku);
@@ -5777,6 +5786,21 @@ async function autoshipRoute(env, url) {
     if (r.ok) st.shipped = (st.shipped || 0) + 1;
     await autoshipSave(env, st);
     return Response.json({ result: r });
+  }
+  if (api === "reline") {
+    // Writes only to the labels check store (never Sellercloud): applies the Nov 27 wrong-line rule to stored checks.
+    const date = (url.searchParams.get("date") || "").trim();
+    if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
+    const vals = Object.values(await labelsChecks(env, date));
+    const hit = [];
+    for (const x of vals) {
+      const rowSku = x.labelSku && x.labelSku !== "UNKNOWN" ? x.labelSku : "";
+      if (!x.good || !rowSku || !x.items || x.items.length !== 1 || x.items[0].sku === rowSku) continue;
+      const v = { ...x, good: false, kind: "wrong", reasons: [`wrong line: this line is ${rowSku} but Sellercloud has ${x.items[0].sku} for this order`] };
+      hit.push(v);
+    }
+    if (url.searchParams.get("go") === "1" && hit.length) await labelsCall(env, "/checks-put", { date, items: hit });
+    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku, x.items[0].sku + " x" + x.items[0].qty, x.shipped]) });
   }
   if (api === "rows") {
     // Read only: stored checks grouped by the label's product; lists groups holding more than one Sellercloud product.
