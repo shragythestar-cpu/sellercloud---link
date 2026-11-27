@@ -5828,7 +5828,7 @@ async function autoshipRoute(env, url) {
       hit.push(v);
     }
     if (url.searchParams.get("go") === "1" && hit.length) await labelsCall(env, "/checks-put", { date, items: hit });
-    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku || String(x.title || "").slice(0, 40), x.items[0].sku + " x" + x.items[0].qty, x.kind]) });
+    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku || String(x.title || "").slice(0, 40), (x.items && x.items[0] ? x.items[0].sku + " x" + x.items[0].qty : "-"), x.kind]) });
   }
   if (api === "rows") {
     // Read only: stored checks grouped by the label's product; lists groups holding more than one Sellercloud product.
