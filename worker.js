@@ -5778,6 +5778,13 @@ async function autoshipRoute(env, url) {
     await autoshipSave(env, st);
     return Response.json({ result: r });
   }
+  if (api === "lookup") {
+    // Read only: what Sellercloud holds now for some Temu orders (&pos=PO-1,PO-2, up to 25).
+    const pos = (url.searchParams.get("pos") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 25);
+    const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: pos });
+    const found = new Map((data.Items || []).map((o) => [String(o.OrderSourceOrderID || "").trim(), o]));
+    return Response.json({ orders: pos.map((po) => { const o = found.get(po); return o ? [po, o.ID, o.ShippingStatus, (o.Items || o.OrderItems || []).map((i) => String(i.ProductID || i.SKU) + " x" + (i.Qty ?? i.Quantity)).join(" + ")] : [po, null]; }) });
+  }
   if (api === "check") {
     // Read only: run the labels check for a day (optionally one batch, optionally only labels not checked yet).
     const date = (url.searchParams.get("date") || "").trim();
