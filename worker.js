@@ -5563,25 +5563,24 @@ function labelsLineRules(list, ctx, out = {}) {
   // Nov 27 (Shragy): "if seller cloud does not have a order at all just mark it as good" — not-found orders stay good.
   const changed = [];
   const unsure = (x, why) => { Object.assign(x, { good: false, kind: "unconfirmed", reasons: [why] }); changed.push(x); };
-  // Auto-link a line with no Sellercloud SKU: every one of its single-product orders (2 or more) has the same real
-  // Sellercloud SKU, and that product's name matches the listing title. Saved in out.links (title -> sku).
+  // Nov 27 (Shragy): "if it matches with the temu sku and the main packing slip then its good". A line with no
+  // linked SKU takes its SKU from Sellercloud: the SKU its orders in that batch have. All agree -> that SKU; a clear
+  // majority (more than half) -> that SKU, and the rest are on the wrong line; no majority -> can't confirm.
   out.links = out.links || {};
-  const byTitle = new Map();
+  const lineKey = (x) => String(x.batchId || "") + "|" + labelsTitle(x.title);
+  const byLine = new Map();
   for (const x of ctx || []) {
-    if (!x || lRealSku(x.labelSku) || x.notInSc || !x.items || x.items.length !== 1) continue;
-    const t = labelsTitle(x.title);
-    if (!t) continue;
-    if (!byTitle.has(t)) byTitle.set(t, []);
-    byTitle.get(t).push(x.items[0]);
+    if (!x || lRealSku(x.labelSku) || x.notInSc || !x.items || x.items.length !== 1 || !lRealSku(x.items[0].sku)) continue;
+    const k = lineKey(x);
+    if (!byLine.has(k)) byLine.set(k, new Map());
+    const m = byLine.get(k);
+    m.set(x.items[0].sku, (m.get(x.items[0].sku) || 0) + 1);
   }
-  for (const [t, its] of byTitle) {
-    const skus = new Set(its.map((i) => i.sku));
-    if (its.length < 2 || skus.size !== 1) continue;
-    const sku = its[0].sku;
-    if (!lRealSku(sku)) continue;
-    const nm = its[0].name || sku;
-    const shared = lToks(t).filter((w) => new Set([...lToks(nm), ...lToks(sku)]).has(w)).length;
-    if (shared >= 2 && (lOverlap(t, nm) >= 0.5 || lOverlap(t, sku) >= 0.5)) out.links[t] = sku;
+  const lineSku = new Map();
+  for (const [k, m] of byLine) {
+    const tot = [...m.values()].reduce((a, b) => a + b, 0);
+    const [top, n] = [...m].sort((a, b) => b[1] - a[1])[0];
+    if (n * 2 > tot) lineSku.set(k, top);
   }
   for (const x of list) {
     if (!x || !x.good) continue;
@@ -5589,8 +5588,8 @@ function labelsLineRules(list, ctx, out = {}) {
     if (!x.items || x.items.length !== 1) continue;
     const sku = x.items[0].sku;
     if (!lRealSku(sku)) { unsure(x, `can't confirm: Sellercloud has no SKU for this order's product ("${lShort(x.items[0].name || "unknown")}")`); continue; }
-    if (!lRealSku(x.labelSku) && out.links[labelsTitle(x.title)]) x.labelSku = out.links[labelsTitle(x.title)];
-    if (!lRealSku(x.labelSku)) { unsure(x, `can't confirm: this line isn't linked to a Sellercloud SKU (Sellercloud has ${sku} for this order)`); continue; }
+    if (!lRealSku(x.labelSku) && lineSku.has(lineKey(x))) x.labelSku = lineSku.get(lineKey(x));
+    if (!lRealSku(x.labelSku)) { unsure(x, `can't confirm: this line's orders don't share one Sellercloud SKU (this order has ${sku})`); continue; }
     if (x.labelSku !== sku) {
       Object.assign(x, { good: false, kind: "wrong", reasons: [`wrong line: this line is ${x.labelSku} but Sellercloud has ${sku} for this order`] });
       changed.push(x);
