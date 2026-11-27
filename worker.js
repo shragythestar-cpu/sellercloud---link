@@ -89,7 +89,7 @@
 //   Scan station (Nov 25): the Hub's FBM printing tab (GET /scan only says so now). With the Hub key:
 //     GET /labels/day?date= (the day's batches, lines, printed packages, UPC links; each line has scSku, its Sellercloud SKU,
 //     learned read-only from one Sellercloud order per product title and kept in KV labels:titlesku:v1); GET /labels/upc?upc= (Sellercloud
-//     products with that UPC, read-only, kept 7 days in KV, plus saved links); POST /labels/printed {items:[{batchId,pkg}],by};
+//     products with that UPC, read-only, kept 7 days in KV, plus saved links); POST /labels/printed {items:[{batchId,pkg}],by}; POST /labels/unprinted {items:[{batchId,pkg}]} (takes printed marks back off);
 //     POST /labels/link {upc,sku[,remove]}. The page prints a scanned product's labels grouped by units per package.
 //     GET /labels/photo?sku= (read-only: the catalog image, else Sellercloud product images; also tried without the platform name; kept 7 days in KV; none kept 1 hour).
 //   /assemble/platforms  (ASSEMBLE_KEY) platforms for "Create final SKU": prefix and company each (company: Text PLATFORM_COMPANY_<KEY>)
@@ -3722,7 +3722,7 @@ async function handle(request, env) {
   // The scan station lives in the Production Hub's FBM printing tab (Nov 25, Shragy: "i need it in the hub only").
   if (p0 === "/scan") return new Response("The scan station is in the Production Hub, tab FBM printing.", { status: 410, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
   if (p0.startsWith("/labels/")) {
-    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link" || p0 === "/labels/printed" || p0 === "/labels/link" || p0 === "/labels/check" || p0 === "/labels/aside" || p0 === "/labels/sku-link";
+    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link" || p0 === "/labels/printed" || p0 === "/labels/unprinted" || p0 === "/labels/link" || p0 === "/labels/check" || p0 === "/labels/aside" || p0 === "/labels/sku-link";
     if (request.method !== (wantPost ? "POST" : "GET")) return json({ error: wantPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
     const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
     const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
@@ -4908,6 +4908,25 @@ async function scanRoute(request, env, path, url) {
       const done = await labelsCall(env, "/printed", { items: clean, by: String(body.by || "").trim().slice(0, 100) || "Scan station" });
       // Auto mark shipped (switched off unless turned on): queue the printed packages for the timer.
       try { await autoshipEnqueue(env, clean, String(body.by || "").trim().slice(0, 100)); } catch (e) { console.log("autoship queue failed: " + e.message); }
+      return json(done);
+    }
+    case "/labels/unprinted": {
+      // Nov 27 (Shragy: "we pressed print mixed orders ... nothing came out and it went down to zero"):
+      // the Hub's "Nothing came out" button puts the labels of its last print back on the list.
+      // Only the labels store's printed marks change, and the packages leave the auto ship queue until printed again.
+      const items = Array.isArray(body.items) ? body.items.slice(0, 2000) : [];
+      const clean = items.map((x) => ({ batchId: String(x?.batchId || "").trim(), pkg: String(x?.pkg || "").trim().slice(0, 120) }))
+        .filter((x) => /^[A-Za-z0-9._-]{1,80}$/.test(x.batchId) && x.pkg);
+      if (!clean.length) return json({ error: "items (batchId and pkg each) are needed." }, 400);
+      const done = await labelsCall(env, "/unprinted", { items: clean });
+      try {
+        if (env.TOKEN_KV) {
+          const ids = new Set(clean.map((x) => x.batchId + "|" + x.pkg));
+          const q = (await env.TOKEN_KV.get(AUTOSHIP_QUEUE, "json")) || [];
+          const left = q.filter((x) => !ids.has(x.batchId + "|" + x.pkg));
+          if (left.length !== q.length) await env.TOKEN_KV.put(AUTOSHIP_QUEUE, JSON.stringify(left));
+        }
+      } catch (e) { console.log("autoship unqueue failed: " + e.message); }
       return json(done);
     }
     case "/labels/sku-link": {
