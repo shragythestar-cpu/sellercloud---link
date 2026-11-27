@@ -5558,16 +5558,38 @@ async function labelsChecks(env, date) {
 //   Sellercloud product. When the title holds more than one, only the clear majority product passes; the rest (or all,
 //   on a tie) are on the wrong line. Orders Sellercloud doesn't have stay as Shragy set on Nov 26.
 const lRealSku = (x) => !!x && String(x).trim().toUpperCase() !== "UNKNOWN";
-function labelsLineRules(list, ctx) {
+function labelsLineRules(list, ctx, out = {}) {
   // Nov 27 (Shragy): "dont say good when you dont really know". Good needs Sellercloud to confirm the line's own SKU.
+  // Nov 27 (Shragy): "if seller cloud does not have a order at all just mark it as good" — not-found orders stay good.
   const changed = [];
   const unsure = (x, why) => { Object.assign(x, { good: false, kind: "unconfirmed", reasons: [why] }); changed.push(x); };
+  // Auto-link a line with no Sellercloud SKU: every one of its single-product orders (2 or more) has the same real
+  // Sellercloud SKU, and that product's name matches the listing title. Saved in out.links (title -> sku).
+  out.links = out.links || {};
+  const byTitle = new Map();
+  for (const x of ctx || []) {
+    if (!x || lRealSku(x.labelSku) || x.notInSc || !x.items || x.items.length !== 1) continue;
+    const t = labelsTitle(x.title);
+    if (!t) continue;
+    if (!byTitle.has(t)) byTitle.set(t, []);
+    byTitle.get(t).push(x.items[0]);
+  }
+  for (const [t, its] of byTitle) {
+    const skus = new Set(its.map((i) => i.sku));
+    if (its.length < 2 || skus.size !== 1) continue;
+    const sku = its[0].sku;
+    if (!lRealSku(sku)) continue;
+    const nm = its[0].name || sku;
+    const shared = lToks(t).filter((w) => new Set([...lToks(nm), ...lToks(sku)]).has(w)).length;
+    if (shared >= 2 && (lOverlap(t, nm) >= 0.5 || lOverlap(t, sku) >= 0.5)) out.links[t] = sku;
+  }
   for (const x of list) {
     if (!x || !x.good) continue;
-    if (x.notInSc) { unsure(x, "can't confirm: Sellercloud doesn't have this order"); continue; }
+    if (x.notInSc) continue;
     if (!x.items || x.items.length !== 1) continue;
     const sku = x.items[0].sku;
     if (!lRealSku(sku)) { unsure(x, `can't confirm: Sellercloud has no SKU for this order's product ("${lShort(x.items[0].name || "unknown")}")`); continue; }
+    if (!lRealSku(x.labelSku) && out.links[labelsTitle(x.title)]) x.labelSku = out.links[labelsTitle(x.title)];
     if (!lRealSku(x.labelSku)) { unsure(x, `can't confirm: this line isn't linked to a Sellercloud SKU (Sellercloud has ${sku} for this order)`); continue; }
     if (x.labelSku !== sku) {
       Object.assign(x, { good: false, kind: "wrong", reasons: [`wrong line: this line is ${x.labelSku} but Sellercloud has ${sku} for this order`] });
@@ -5575,6 +5597,17 @@ function labelsLineRules(list, ctx) {
     }
   }
   return changed;
+}
+// Saves auto-links from labelsLineRules into the title map, never over a SKU already there.
+async function labelsSaveLinks(env, links) {
+  const keys = Object.keys(links || {});
+  if (!keys.length || !env.TOKEN_KV) return 0;
+  let map = {};
+  try { map = JSON.parse((await env.TOKEN_KV.get(LABELS_TITLE_KEY)) || "{}") || {}; } catch { map = {}; }
+  let n = 0;
+  for (const t of keys) { const v = map[t]; if (!(typeof v === "string" && v && !v.startsWith("?") && lRealSku(v))) { map[t] = links[t]; n++; } }
+  if (n) await env.TOKEN_KV.put(LABELS_TITLE_KEY, JSON.stringify(map));
+  return n;
 }
 async function labelsCheckRun(env, date, opts = {}) {
   const day = await labelsCall(env, "/day", { date });
@@ -5720,7 +5753,9 @@ async function labelsCheckRun(env, date, opts = {}) {
   if (results.length) {
     const byId = new Map(Object.values(stored).map((x) => [x.id, x]));
     for (const x of results) byId.set(x.id, x);
-    labelsLineRules(results, [...byId.values()]);
+    const lr = {};
+    labelsLineRules(results, [...byId.values()], lr);
+    await labelsSaveLinks(env, lr.links).catch(() => {});
     await labelsChecks(env, date); // moves an older KV blob over first, so its "aside" marks are kept
     await labelsCall(env, "/checks-put", { date, items: results.map(({ scId, carrier, service, ...keep }) => keep) }).catch(() => {});
   }
@@ -5861,7 +5896,13 @@ async function autoshipRoute(env, url) {
     const date = (url.searchParams.get("date") || "").trim();
     if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
     const vals = Object.values(await labelsChecks(env, date));
-    const hit = labelsLineRules(vals.filter((x) => x.good).map((x) => ({ ...x })), vals);
+    // Labels marked "can't confirm" are judged again from scratch (they were good before the line rules).
+    const was = new Set(vals.filter((x) => x.kind === "unconfirmed").map((x) => x.id));
+    const base = vals.filter((x) => x.good || was.has(x.id)).map((x) => (was.has(x.id) ? { ...x, good: true, kind: "good", reasons: [] } : { ...x }));
+    const lr = {};
+    const ch = new Set(labelsLineRules(base, vals, lr).map((x) => x.id));
+    const hit = base.filter((x) => ch.has(x.id) || (was.has(x.id) && x.good));
+    if (url.searchParams.get("go") === "1") await labelsSaveLinks(env, lr.links);
     for (const x of vals) {
       if (hit.some((h) => h.id === x.id)) continue;
       const rowSku = x.labelSku && x.labelSku !== "UNKNOWN" ? x.labelSku : "";
@@ -5870,7 +5911,7 @@ async function autoshipRoute(env, url) {
       hit.push(v);
     }
     if (url.searchParams.get("go") === "1" && hit.length) await labelsCall(env, "/checks-put", { date, items: hit });
-    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku || String(x.title || "").slice(0, 40), (x.items && x.items[0] ? x.items[0].sku + " x" + x.items[0].qty : "-"), x.kind]) });
+    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, links: lr.links, nowGood: hit.filter((x) => x.good).length, list: hit.map((x) => [x.po, x.labelSku || String(x.title || "").slice(0, 40), (x.items && x.items[0] ? x.items[0].sku + " x" + x.items[0].qty : "-"), x.kind]) });
   }
   if (api === "unlinked") {
     // Read only: the day's listing titles with no Sellercloud SKU (the Hub shows them red).
