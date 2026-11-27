@@ -5531,7 +5531,7 @@ function labelsLineRules(list, ctx) {
     const sku = x.items[0].sku;
     if (!lRealSku(sku)) {
       // No SKU in Sellercloud: its product name must be the line's product (the title on top of the line).
-      if (lSame(x.title, x.items[0].name)) continue;
+      if (lSame(x.title, x.items[0].name) || lOverlap(x.title, x.items[0].name) >= 0.7) continue;
       Object.assign(x, { good: false, kind: "other", reasons: [`wrong line: Sellercloud has no SKU for this order and its product is "${lShort(x.items[0].name || "unknown")}", not this line's product; set it aside`] });
       changed.push(x); continue;
     }
