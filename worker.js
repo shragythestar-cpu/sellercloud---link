@@ -5989,6 +5989,21 @@ async function autoshipRoute(env, url) {
     const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
     return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
   }
+  if (api === "day") {
+    // Read only: the day's batches (no file bytes) and, with &po=a,b, the lines of those orders.
+    const date = (url.searchParams.get("date") || "").trim();
+    if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
+    const day = await labelsCall(env, "/day", { date });
+    const pos = new Set((url.searchParams.get("po") || "").split(",").map((x) => x.trim()).filter(Boolean));
+    const batches = (day.batches || []).map((b) => {
+      const { lines, ...rest } = b;
+      const meta = {};
+      for (const [k, v] of Object.entries(rest)) meta[k] = typeof v === "string" && v.length > 200 ? v.slice(0, 60) + "…(" + v.length + ")" : v;
+      const ls = lines || [];
+      return { ...meta, lineCount: ls.length, withPage: ls.filter((l) => l.page != null).length, maxPage: ls.reduce((m, l) => Math.max(m, Number(l.page) || 0), 0), sample: ls.slice(0, 2), hits: pos.size ? ls.filter((l) => pos.has(String(l.orderId || ""))) : undefined };
+    });
+    return Response.json({ date, keys: Object.keys(day), printedN: (day.printed || []).length, batches });
+  }
   if (api === "printed" || api === "unprint") {
     // printed: read only, the day's printed marks made since &since= (ISO), with each package's lines and check.
     // unprint (&go=1 to write): removes those marks (only in the labels store), &only=mixed keeps it to mixed packages.
