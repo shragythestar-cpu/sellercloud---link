@@ -5585,7 +5585,9 @@ function labelsLineRules(list, ctx, out = {}) {
     // The packing slip shows the listing title, so the SKU must also be that product: it has to share a real word
     // with the title (a Glade line whose only order is Cookie Caramel Rush in Sellercloud is not confirmed).
     const tw = new Set(lToks(names.get(k)).filter((w) => w.length >= 3 && w !== "temu"));
-    const sw = [...lToks(top), ...lToks(skuName.get(top))].filter((w) => w.length >= 3 && w !== "temu");
+    // The SKU itself, not the order's item name (that's Temu's listing title echoed back, e.g. "Glade ..." on a
+    // TEMU - Cookie Caramel Rush order).
+    const sw = lToks(top).filter((w) => w.length >= 3 && w !== "temu");
     if (n * 2 > tot && sw.some((w) => tw.has(w))) lineSku.set(k, top);
   }
   for (const x of list) {
