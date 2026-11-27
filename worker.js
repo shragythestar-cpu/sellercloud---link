@@ -6045,6 +6045,7 @@ async function autoshipRoute(env, url) {
       const ls = lines || [];
       return { ...meta, lineCount: ls.length, withPage: ls.filter((l) => l.page != null).length, maxPage: ls.reduce((m, l) => Math.max(m, Number(l.page) || 0), 0), sample: ls.slice(0, 2), hits: pos.size ? ls.filter((l) => pos.has(String(l.orderId || ""))) : undefined };
     });
+    if (url.searchParams.get("lines") === "1") return Response.json((day.batches || []).flatMap((b) => (b.lines || []).map((l) => [b.batchId.slice(-4), l.idx, l.tracking || "", l.orderId || "", l.page ?? null, String(l.sku || "").slice(0, 24), l.qty, l.cost ?? null])));
     return Response.json({ date, keys: Object.keys(day), printedN: (day.printed || []).length, batches });
   }
   if (api === "printed" || api === "unprint") {
