@@ -3722,7 +3722,7 @@ async function handle(request, env) {
   // The scan station lives in the Production Hub's FBM printing tab (Nov 25, Shragy: "i need it in the hub only").
   if (p0 === "/scan") return new Response("The scan station is in the Production Hub, tab FBM printing.", { status: 410, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
   if (p0.startsWith("/labels/")) {
-    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link" || p0 === "/labels/printed" || p0 === "/labels/link" || p0 === "/labels/check" || p0 === "/labels/aside";
+    const wantPost = p0 === "/labels/downloaded" || p0 === "/labels/file-link" || p0 === "/labels/printed" || p0 === "/labels/link" || p0 === "/labels/check" || p0 === "/labels/aside" || p0 === "/labels/sku-link";
     if (request.method !== (wantPost ? "POST" : "GET")) return json({ error: wantPost ? `Use POST for ${p0}.` : "Only GET is allowed here." }, 405);
     const k = (url.searchParams.get("key") || request.headers.get("X-App-Key") || "").trim();
     const ok = !!k && ((env.ASSEMBLE_KEY && safeEqual(k, env.ASSEMBLE_KEY.trim())) || (env.APP_KEY && safeEqual(k, env.APP_KEY.trim())));
@@ -4764,13 +4764,13 @@ async function labelsAddScSkus(env, day, date) {
   if (need.length) {
     const picks = new Set();
     for (const t of need) {
-      let single = null, any = null;
+      let singles = 0, any = null;
       for (const [oid, ts] of byOrder) {
         if (!ts.has(t)) continue;
         if (!any) any = oid;
-        if (ts.size === 1) { single = oid; break; }
+        if (ts.size === 1) { picks.add(oid); if (++singles >= 5) break; }
       }
-      if (single || any) picks.add(single || any);
+      if (!singles && any) picks.add(any);
     }
     const ids = [...picks].slice(0, 300);
     const orders = [];
@@ -4779,6 +4779,7 @@ async function labelsAddScSkus(env, day, date) {
       const data = await scGet(env, "/Orders", { pageNumber: 1, pageSize: 25, orderSourceOrderIDList: ids.slice(i, i + 25) });
       orders.push(...(data?.Items || []));
     }
+    const seen = new Map();
     // Two passes: single-product orders first, then mixed orders by elimination or matching name.
     for (let pass = 0; pass < 2; pass++) {
       for (const o of orders) {
@@ -4786,7 +4787,15 @@ async function labelsAddScSkus(env, day, date) {
         const items = (o.Items || []).filter((i) => i?.ProductID);
         const pids = [...new Set(items.map((i) => String(i.ProductID)))];
         if (!titles.length || !pids.length) continue;
-        if (titles.length === 1 && pids.length === 1) { if (!known(titles[0])) map[titles[0]] = pids[0]; continue; }
+        if (titles.length === 1 && pids.length === 1) {
+          // Nov 27: only learn a real SKU, and only when every single-product sample of the title agrees.
+          const t0 = titles[0];
+          if (!known(t0) && lRealSku(pids[0])) {
+            if (seen.has(t0) && seen.get(t0) !== pids[0]) { seen.set(t0, "!"); delete map[t0]; }
+            else if (!seen.has(t0)) { seen.set(t0, pids[0]); map[t0] = pids[0]; }
+          }
+          continue;
+        }
         for (const t of titles) {
           if (known(t)) continue;
           const byName = items.filter((i) => labelsTitle(i.DisplayName) === t || labelsTitle(i.ProductName) === t);
@@ -4899,6 +4908,37 @@ async function scanRoute(request, env, path, url) {
       // Auto mark shipped (switched off unless turned on): queue the printed packages for the timer.
       try { await autoshipEnqueue(env, clean, String(body.by || "").trim().slice(0, 100)); } catch (e) { console.log("autoship queue failed: " + e.message); }
       return json(done);
+    }
+    case "/labels/sku-link": {
+      // Nov 27 (Shragy): links a line (a listing title) to its Sellercloud SKU, for lines the worker couldn't link itself.
+      // Only a SKU Sellercloud shows for that line's own orders that day can be chosen. Remembered for the title.
+      const date = String(body.date || "").trim();
+      const title = labelsTitle(body.title);
+      const sku = String(body.sku || "").trim().slice(0, 100);
+      if (!isDay(date) || !title || !sku) return json({ error: "date, title and sku are needed." }, 400);
+      const stored = await labelsChecks(env, date);
+      const mine = Object.values(stored).filter((x) => labelsTitle(x.title) === title.slice(0, 200));
+      const offered = new Set(mine.filter((x) => x.items && x.items.length === 1 && lRealSku(x.items[0].sku)).map((x) => x.items[0].sku));
+      if (!offered.has(sku)) return json({ error: "Sellercloud doesn't show that SKU for this line's orders." }, 400);
+      let map = {};
+      try { map = JSON.parse((env.TOKEN_KV && (await env.TOKEN_KV.get(LABELS_TITLE_KEY))) || "{}") || {}; } catch { map = {}; }
+      map[title] = sku;
+      if (env.TOKEN_KV) await env.TOKEN_KV.put(LABELS_TITLE_KEY, JSON.stringify(map));
+      // Re-judge this line's stored results against the new line SKU (no new Sellercloud call needed).
+      const upd = [];
+      for (const x of mine) {
+        if (x.notInSc || !x.items || x.items.length !== 1) continue;
+        if (x.kind !== "unconfirmed" && !(x.kind === "wrong" && /^wrong line/.test(x.reasons?.[0] || "")) && !x.good) continue;
+        const v = { ...x, labelSku: sku };
+        const it = x.items[0];
+        if (!lRealSku(it.sku)) continue;
+        if (it.sku === sku && it.qty === x.labelQty) Object.assign(v, { good: true, kind: x.shipped ? "shipped" : "good", reasons: [] });
+        else if (it.sku !== sku) Object.assign(v, { good: false, kind: "wrong", reasons: [`wrong line: this line is ${sku} but Sellercloud has ${it.sku} for this order`] });
+        else Object.assign(v, { good: false, kind: "wrong", reasons: ["qty: the label is for " + x.labelQty + ", Sellercloud has " + it.qty] });
+        upd.push(v);
+      }
+      if (upd.length) await labelsCall(env, "/checks-put", { date, items: upd });
+      return json({ ok: true, sku, changed: upd.length, checks: await labelsChecks(env, date) });
     }
     case "/labels/link": {
       const upc = upcKey(body.upc);
@@ -5829,6 +5869,16 @@ async function autoshipRoute(env, url) {
     }
     if (url.searchParams.get("go") === "1" && hit.length) await labelsCall(env, "/checks-put", { date, items: hit });
     return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku || String(x.title || "").slice(0, 40), (x.items && x.items[0] ? x.items[0].sku + " x" + x.items[0].qty : "-"), x.kind]) });
+  }
+  if (api === "unlinked") {
+    // Read only: the day's listing titles with no Sellercloud SKU (the Hub shows them red).
+    const date = (url.searchParams.get("date") || "").trim();
+    if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
+    const day = await labelsCall(env, "/day", { date });
+    try { await labelsAddScSkus(env, day, date); } catch {}
+    const m = new Map();
+    for (const b of day.batches || []) for (const l of b.lines || []) if (!l.scSku) { const t = String(l.productName || l.sku || "").slice(0, 70); m.set(t, (m.get(t) || 0) + 1); }
+    return Response.json({ titles: m.size, lines: [...m].sort((a, b) => b[1] - a[1]) });
   }
   if (api === "rows") {
     // Read only: stored checks grouped by the label's product; lists groups holding more than one Sellercloud product.
