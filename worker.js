@@ -5568,19 +5568,25 @@ function labelsLineRules(list, ctx, out = {}) {
   // majority (more than half) -> that SKU, and the rest are on the wrong line; no majority -> can't confirm.
   out.links = out.links || {};
   const lineKey = (x) => String(x.batchId || "") + "|" + labelsTitle(x.title);
-  const byLine = new Map();
+  const byLine = new Map(), names = new Map(), skuName = new Map();
   for (const x of ctx || []) {
     if (!x || lRealSku(x.labelSku) || x.notInSc || !x.items || x.items.length !== 1 || !lRealSku(x.items[0].sku)) continue;
     const k = lineKey(x);
     if (!byLine.has(k)) byLine.set(k, new Map());
     const m = byLine.get(k);
     m.set(x.items[0].sku, (m.get(x.items[0].sku) || 0) + 1);
+    names.set(k, labelsTitle(x.title));
+    skuName.set(x.items[0].sku, String(x.items[0].name || ""));
   }
   const lineSku = new Map();
   for (const [k, m] of byLine) {
     const tot = [...m.values()].reduce((a, b) => a + b, 0);
     const [top, n] = [...m].sort((a, b) => b[1] - a[1])[0];
-    if (n * 2 > tot) lineSku.set(k, top);
+    // The packing slip shows the listing title, so the SKU must also be that product: it has to share a real word
+    // with the title (a Glade line whose only order is Cookie Caramel Rush in Sellercloud is not confirmed).
+    const tw = new Set(lToks(names.get(k)).filter((w) => w.length >= 3 && w !== "temu"));
+    const sw = [...lToks(top), ...lToks(skuName.get(top))].filter((w) => w.length >= 3 && w !== "temu");
+    if (n * 2 > tot && sw.some((w) => tw.has(w))) lineSku.set(k, top);
   }
   for (const x of list) {
     if (!x || !x.good) continue;
