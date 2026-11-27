@@ -5595,7 +5595,14 @@ function labelsLineRules(list, ctx, out = {}) {
     if (x.notInSc) continue;
     if (!x.items || x.items.length !== 1) continue;
     const sku = x.items[0].sku;
-    if (!lRealSku(sku)) { unsure(x, `can't confirm: Sellercloud has no SKU for this order's product ("${lShort(x.items[0].name || "unknown")}")`); continue; }
+    if (!lRealSku(sku)) {
+      // Nov 27 (Shragy): with no Sellercloud SKU, the product name decides: same product as the line -> good
+      // ("1 pack vs 2 pack is 99% percent of the time accurate"); another product -> not good (wrong packing slip).
+      const nm = x.items[0].name || "";
+      if (nm && (lSame(x.title, nm) || lOverlap(x.title, nm) >= 0.8)) continue;
+      unsure(x, `not this line's product: Sellercloud has no SKU, and its product is "${lShort(nm || "unknown")}"`);
+      continue;
+    }
     if (!lRealSku(x.labelSku) && lineSku.has(lineKey(x))) x.labelSku = lineSku.get(lineKey(x));
     if (!lRealSku(x.labelSku)) { unsure(x, `can't confirm: this line's orders don't share one Sellercloud SKU (this order has ${sku})`); continue; }
     if (x.labelSku !== sku) {
