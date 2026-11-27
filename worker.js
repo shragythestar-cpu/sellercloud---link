@@ -5989,6 +5989,49 @@ async function autoshipRoute(env, url) {
     const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
     return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
   }
+  if (api === "pdfraw" || api === "pdfscan") {
+    // Read only. pdfraw: the batch PDF itself. pdfscan: a page that reads it with pdf.js and lists each page's text length.
+    const batchId = (url.searchParams.get("batchId") || "").trim();
+    if (!/^[A-Za-z0-9._-]{1,80}$/.test(batchId)) return Response.json({ error: "add &batchId=" }, { status: 400 });
+    if (api === "pdfraw") {
+      const buf = await env.TOKEN_KV.get(labelFileKey(batchId), "arrayBuffer");
+      if (!buf) return Response.json({ error: "no file" }, { status: 404 });
+      return new Response(buf, { headers: { "content-type": "application/pdf", "cache-control": "no-store" } });
+    }
+    const raw = new URL(url); raw.searchParams.set("api", "pdfraw");
+    const pages = JSON.stringify((url.searchParams.get("pages") || "").split(",").map(Number).filter((n) => n > 0));
+    const html = `<!doctype html><meta charset="utf-8"><body><pre id="out">loading…</pre><div id="imgs"></div>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>
+(async () => {
+  const out = document.getElementById('out');
+  try {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+    const bytes = await (await fetch(${JSON.stringify(raw.toString())})).arrayBuffer();
+    const doc = await pdfjsLib.getDocument({ data: new Uint8Array(bytes) }).promise;
+    const show = ${pages};
+    const rows = [];
+    let over = 0;
+    for (let i = 1; i <= doc.numPages; i++) {
+      const pg = await doc.getPage(i);
+      const tc = await pg.getTextContent();
+      const t = tc.items.map((x) => x.str || '').join('').replace(/\\s+/g, '');
+      if (t.length > 20) over++;
+      if (show.includes(i) || (show.length === 0 && t.length > 20)) rows.push(i + ': ' + t.length + ' ' + t.slice(0, 160));
+    }
+    out.textContent = 'pages ' + doc.numPages + ', pages with text over 20: ' + over + '\\n' + rows.slice(0, 300).join('\\n');
+    for (const n of show.slice(0, 3)) {
+      const pg = await doc.getPage(n);
+      const vp = pg.getViewport({ scale: 1 });
+      const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height; c.style.border = '1px solid #999';
+      await pg.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+      document.getElementById('imgs').appendChild(c);
+    }
+  } catch (e) { out.textContent = 'error ' + e; }
+})();
+</script>`;
+    return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
+  }
   if (api === "day") {
     // Read only: the day's batches (no file bytes) and, with &po=a,b, the lines of those orders.
     const date = (url.searchParams.get("date") || "").trim();
