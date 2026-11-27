@@ -5733,6 +5733,14 @@ async function labelsCheckRun(env, date, opts = {}) {
     // Nov 26 (Shragy): an order Sellercloud doesn't have yet is not a bad label; it prints normally and auto mark
     // shipped skips it (nothing to mark). r.notInSc tells the two apart.
     if (orders.length === 1 && !o) r.notInSc = true;
+    // Nov 27 (Shragy: mixed slips): one label for several orders still needs a packing slip that lists what goes in
+    // that box, so the slip gets every order number and the items of each order Sellercloud has. Judging is unchanged.
+    if (orders.length > 1) {
+      r.pos = orders.slice(0, 10);
+      const m = new Map();
+      for (const oid of orders) { const x = sc.get(oid); if (!x) continue; for (const it of itemsOf(x)) { const prev = m.get(it.sku); if (prev) prev.qty += it.qty; else m.set(it.sku, { ...it }); } }
+      r.items = [...m.values()];
+    }
     if (o) {
       r.scId = o.ID;
       r.items = itemsOf(o);
