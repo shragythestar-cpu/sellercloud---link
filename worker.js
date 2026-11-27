@@ -5530,7 +5530,9 @@ function labelsLineRules(list, ctx) {
     if (!x || !x.good || !x.items || x.items.length !== 1) continue;
     const sku = x.items[0].sku;
     if (!lRealSku(sku)) {
-      Object.assign(x, { good: false, kind: "other", reasons: ["Sellercloud lists this order's product as UNKNOWN, so it can't be confirmed"] });
+      // No SKU in Sellercloud: its product name must be the line's product (the title on top of the line).
+      if (lSame(x.title, x.items[0].name)) continue;
+      Object.assign(x, { good: false, kind: "other", reasons: [`wrong line: Sellercloud has no SKU for this order and its product is "${lShort(x.items[0].name || "unknown")}", not this line's product; set it aside`] });
       changed.push(x); continue;
     }
     if (lRealSku(x.labelSku)) continue;
@@ -5854,7 +5856,7 @@ async function autoshipRoute(env, url) {
       g.set(k, e);
     }
     const q = (url.searchParams.get("q") || "").toLowerCase();
-    if (q) return Response.json({ recs: vals.filter((x) => String(x.title || "").toLowerCase().includes(q)).map((x) => [x.po, x.labelSku, x.good, x.kind, x.labelQty, (x.items || []).map((i) => i.sku + " x" + i.qty + " " + String(i.name || "").slice(0, 50)).join(" + ")]) });
+    if (q) return Response.json({ recs: vals.filter((x) => String(x.title || "").toLowerCase().includes(q) || String(x.labelSku || "").toLowerCase() === q).map((x) => [x.po, x.labelSku, x.good, x.kind, x.labelQty, (x.items || []).map((i) => i.sku + " x" + i.qty + " " + String(i.name || "").slice(0, 50)).join(" + ")]) });
     const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
     return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
   }
