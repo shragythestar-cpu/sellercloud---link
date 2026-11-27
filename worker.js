@@ -4790,14 +4790,15 @@ async function labelsAddScSkus(env, day, date) {
         if (titles.length === 1 && pids.length === 1) {
           // Nov 27: only learn a real SKU, and only when every single-product sample of the title agrees.
           const t0 = titles[0];
-          if (!known(t0) && lRealSku(pids[0])) {
-            if (seen.has(t0) && seen.get(t0) !== pids[0]) { seen.set(t0, "!"); delete map[t0]; }
-            else if (!seen.has(t0)) { seen.set(t0, pids[0]); map[t0] = pids[0]; }
+          if (lRealSku(pids[0]) && (!known(t0) || seen.has(t0))) {
+            const prev = seen.get(t0);
+            if (prev === undefined) { seen.set(t0, pids[0]); map[t0] = pids[0]; }
+            else if (prev !== "!" && prev !== pids[0]) { seen.set(t0, "!"); delete map[t0]; }
           }
           continue;
         }
         for (const t of titles) {
-          if (known(t)) continue;
+          if (known(t) || seen.get(t) === "!") continue;
           const byName = items.filter((i) => labelsTitle(i.DisplayName) === t || labelsTitle(i.ProductName) === t);
           if (byName.length === 1) { map[t] = String(byName[0].ProductID); continue; }
           const used = new Set(titles.filter(known).map((x) => map[x]));
@@ -4928,13 +4929,14 @@ async function scanRoute(request, env, path, url) {
       const upd = [];
       for (const x of mine) {
         if (x.notInSc || !x.items || x.items.length !== 1) continue;
-        if (x.kind !== "unconfirmed" && !(x.kind === "wrong" && /^wrong line/.test(x.reasons?.[0] || "")) && !x.good) continue;
-        const v = { ...x, labelSku: sku };
+        // Only labels whose one problem was the line link: everything else Check found still stands.
+        const lineOnly = x.kind === "unconfirmed" || (x.kind === "wrong" && (x.reasons || []).length === 1 && /^wrong line/.test(x.reasons[0]));
+        if (!lineOnly && !x.good) continue;
         const it = x.items[0];
         if (!lRealSku(it.sku)) continue;
-        if (it.sku === sku && it.qty === x.labelQty) Object.assign(v, { good: true, kind: x.shipped ? "shipped" : "good", reasons: [] });
-        else if (it.sku !== sku) Object.assign(v, { good: false, kind: "wrong", reasons: [`wrong line: this line is ${sku} but Sellercloud has ${it.sku} for this order`] });
-        else Object.assign(v, { good: false, kind: "wrong", reasons: ["qty: the label is for " + x.labelQty + ", Sellercloud has " + it.qty] });
+        const v = { ...x, labelSku: sku };
+        if (it.sku === sku) Object.assign(v, { good: true, kind: x.kind === "shipped" ? "shipped" : "good", reasons: [] });
+        else Object.assign(v, { good: false, kind: "wrong", reasons: [`wrong line: this line is ${sku} but Sellercloud has ${it.sku} for this order`] });
         upd.push(v);
       }
       if (upd.length) await labelsCall(env, "/checks-put", { date, items: upd });
