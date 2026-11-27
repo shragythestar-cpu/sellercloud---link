@@ -6000,6 +6000,7 @@ async function autoshipRoute(env, url) {
     }
     const raw = new URL(url); raw.searchParams.set("api", "pdfraw");
     const pages = JSON.stringify((url.searchParams.get("pages") || "").split(",").map(Number).filter((n) => n > 0));
+    const mapUrl = (() => { if (url.searchParams.get("map") !== "1") return ""; const u = new URL(url); u.searchParams.set("api", "day"); u.searchParams.set("lines", "1"); u.searchParams.set("date", batchId.slice(0, 10)); return u.toString(); })();
     const html = `<!doctype html><meta charset="utf-8"><body><pre id="out">loading…</pre><div id="imgs"></div>
 <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script>
@@ -6020,6 +6021,20 @@ async function autoshipRoute(env, url) {
       if (show.includes(i) || (show.length === 0 && t.length > 20)) rows.push(i + ': ' + t.length + ' ' + t.slice(0, 160));
     }
     out.textContent = 'pages ' + doc.numPages + ', pages with text over 20: ' + over + '\\n' + rows.slice(0, 300).join('\\n');
+    const mapUrl = ${JSON.stringify(mapUrl)};
+    if (mapUrl) {
+      const all = await (await fetch(mapUrl)).json();
+      const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const lines = all.filter((l) => l[0] === ${JSON.stringify(batchId.slice(-4))});
+      const pk = new Map();
+      for (const l of lines) { const k = 't:' + norm(l[2]); if (!pk.has(k)) pk.set(k, { key: k, page: l[4], po: l[3], sku: l[5] }); }
+      const texts = [];
+      for (let i = 1; i <= doc.numPages; i++) { const tc = await (await doc.getPage(i)).getTextContent(); texts.push(norm(tc.items.map((x) => x.str || '').join(''))); }
+      const isLabel = (n) => n >= 1 && n <= doc.numPages && texts[n - 1].length <= 20;
+      const used = new Set(); const bad = [];
+      for (const p of pk.values()) { if (p.page != null && isLabel(p.page) && !used.has(p.page)) used.add(p.page); else bad.push(p.po + ' p' + p.page + ' len' + (texts[p.page - 1] || '').length + ' ' + p.sku); }
+      out.textContent += '\\nMAP packages ' + pk.size + ' unmapped ' + bad.length + '\\n' + bad.slice(0, 100).join('\\n');
+    }
     for (const n of show.slice(0, 3)) {
       const pg = await doc.getPage(n);
       const vp = pg.getViewport({ scale: 1 });
