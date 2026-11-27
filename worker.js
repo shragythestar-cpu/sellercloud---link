@@ -5782,7 +5782,7 @@ async function autoshipRoute(env, url) {
     // Read only: run the labels check for a day (optionally one batch, optionally only labels not checked yet).
     const date = (url.searchParams.get("date") || "").trim();
     if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
-    const r = await labelsCheckRun(env, date, { batchId: url.searchParams.get("batch") || "", onlyNew: url.searchParams.get("new") === "1", title: (url.searchParams.get("title") || "").trim().slice(0, 80) });
+    const r = url.searchParams.get("dry") === "1" ? { results: [], partial: false, unchecked: [] } : await labelsCheckRun(env, date, { batchId: url.searchParams.get("batch") || "", onlyNew: url.searchParams.get("new") === "1", title: (url.searchParams.get("title") || "").trim().slice(0, 80) });
     const stored = await labelsChecks(env, date);
     const vals = Object.values(stored);
     const count = (f) => vals.filter(f).length;
