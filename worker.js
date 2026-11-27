@@ -5108,6 +5108,12 @@ export class LabelStore {
       }
       return out({ ok: true, printed: (body.items || []).length, at });
     }
+    if (path === "/unprinted") {
+      // Nov 27: takes back "printed" marks (only the items sent).
+      let n = 0;
+      for (const x of body.items || []) { this.sql.exec("DELETE FROM printed WHERE batch_id = ? AND pkg = ?", x.batchId, x.pkg); n++; }
+      return out({ ok: true, unprinted: n });
+    }
     if (path === "/links") {
       const rows = this.sql.exec("SELECT sku FROM upc_links WHERE upc = ?", body.upc).toArray();
       return out({ links: rows.map((r) => r.sku) });
@@ -5955,6 +5961,30 @@ async function autoshipRoute(env, url) {
     if (q) return Response.json({ recs: vals.filter((x) => String(x.title || "").toLowerCase().includes(q) || String(x.labelSku || "").toLowerCase() === q).map((x) => [x.po, x.labelSku, x.good, x.kind, x.labelQty, (x.items || []).map((i) => i.sku + " x" + i.qty + " " + String(i.name || "").slice(0, 50)).join(" + ")]) });
     const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
     return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
+  }
+  if (api === "printed" || api === "unprint") {
+    // printed: read only, the day's printed marks made since &since= (ISO), with each package's lines and check.
+    // unprint (&go=1 to write): removes those marks (only in the labels store), &only=mixed keeps it to mixed packages.
+    const date = (url.searchParams.get("date") || "").trim();
+    const since = (url.searchParams.get("since") || "").trim();
+    if (!isDay(date) || !since) return Response.json({ error: "add &date=YYYY-MM-DD&since=ISO" }, { status: 400 });
+    const day = await labelsCall(env, "/day", { date });
+    const checks = await labelsChecks(env, date);
+    const rows = [];
+    for (const pr of day.printed || []) {
+      if (String(pr.at || "") < since) continue;
+      const b = (day.batches || []).find((x) => x.batchId === pr.batchId);
+      const c = checks[pr.batchId + "|" + pr.pkg] || null;
+      const tr = pr.pkg.startsWith("t:") ? pr.pkg.slice(2) : null;
+      const idx = pr.pkg.startsWith("i:") ? Number(pr.pkg.slice(2)) : null;
+      const ls = (b?.lines || []).filter((l) => (tr ? String(l.tracking || "").trim().toUpperCase().replace(/\s+/g, "") === tr.toUpperCase().replace(/\s+/g, "") || String(l.tracking || "").trim() === tr : l.idx === idx));
+      const skus = new Set(ls.map((l) => l.scSku || l.sku));
+      rows.push({ batchId: pr.batchId, pkg: pr.pkg, at: pr.at, by: pr.by, times: pr.times, lines: ls.length, skus: skus.size, mixed: skus.size > 1 || c?.kind === "mixed", kind: c?.kind || null, po: c?.po || ls[0]?.orderId || "" });
+    }
+    const only = url.searchParams.get("only");
+    const pick = rows.filter((r) => only !== "mixed" || r.mixed);
+    if (api === "unprint" && url.searchParams.get("go") === "1" && pick.length) await labelsCall(env, "/unprinted", { items: pick.map((r) => ({ batchId: r.batchId, pkg: r.pkg })) });
+    return Response.json({ wrote: api === "unprint" && url.searchParams.get("go") === "1", n: pick.length, mixed: rows.filter((r) => r.mixed).length, rows: pick.slice(0, 400) });
   }
   if (api === "product") {
     // Read only: Sellercloud catalog products whose SKU or name has &q= (up to 50), with their short fields.
