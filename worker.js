@@ -5778,6 +5778,23 @@ async function autoshipRoute(env, url) {
     await autoshipSave(env, st);
     return Response.json({ result: r });
   }
+  if (api === "rows") {
+    // Read only: stored checks grouped by the label's product; lists groups holding more than one Sellercloud product.
+    const date = (url.searchParams.get("date") || "").trim();
+    if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
+    const vals = Object.values(await labelsChecks(env, date));
+    const g = new Map();
+    for (const x of vals) {
+      const k = (x.labelSku || "") + " | " + String(x.title || "").slice(0, 50);
+      const e = g.get(k) || { n: 0, sc: {} };
+      e.n++;
+      const sk = !x.items || !x.items.length ? "(not in Sellercloud)" : x.items.map((i) => i.sku + " x" + i.qty).join(" + ");
+      (e.sc[sk] = e.sc[sk] || []).push([x.po, x.good, x.kind]);
+      g.set(k, e);
+    }
+    const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
+    return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
+  }
   if (api === "lookup") {
     // Read only: what Sellercloud holds now for some Temu orders (&pos=PO-1,PO-2, up to 25).
     const pos = (url.searchParams.get("pos") || "").split(",").map((x) => x.trim()).filter(Boolean).slice(0, 25);
