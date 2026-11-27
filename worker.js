@@ -4803,7 +4803,7 @@ async function labelsAddScSkus(env, day, date) {
   }
   for (const l of all) {
     const v = map[labelsTitle(l.sku)];
-    l.scSku = v && !v.startsWith("?") ? v : null;
+    l.scSku = v && !v.startsWith("?") && lRealSku(v) ? v : null;
   }
 }
 // A product's photo link: the catalog image (as the Hub's product search shows it), else Sellercloud's product images;
@@ -5510,6 +5510,39 @@ async function labelsChecks(env, date) {
   } catch { return {}; }
 }
 // opts: { want: [{batchId,pkg}] | null (all), batchId, onlyNew }. Returns { results, partial, unchecked (ids), found (ids) }.
+// Nov 27 (Shragy: "i need a 100% fix"). A label is good only when Sellercloud confirms its line's product.
+// - Sellercloud lists the order's product as UNKNOWN: can't be confirmed, not good.
+// - The line has no known SKU (UNKNOWN or not learned): the line is its title, so every label of that title must be one
+//   Sellercloud product. When the title holds more than one, only the clear majority product passes; the rest (or all,
+//   on a tie) are on the wrong line. Orders Sellercloud doesn't have stay as Shragy set on Nov 26.
+const lRealSku = (x) => !!x && String(x).trim().toUpperCase() !== "UNKNOWN";
+function labelsLineRules(list, ctx) {
+  const groups = new Map();
+  for (const x of ctx) {
+    if (!x || !x.items || x.items.length !== 1 || lRealSku(x.labelSku) || !lRealSku(x.items[0].sku)) continue;
+    const k = labelsTitle(x.title);
+    const m = groups.get(k) || new Map();
+    m.set(x.items[0].sku, (m.get(x.items[0].sku) || 0) + 1);
+    groups.set(k, m);
+  }
+  const changed = [];
+  for (const x of list) {
+    if (!x || !x.good || !x.items || x.items.length !== 1) continue;
+    const sku = x.items[0].sku;
+    if (!lRealSku(sku)) {
+      Object.assign(x, { good: false, kind: "other", reasons: ["Sellercloud lists this order's product as UNKNOWN, so it can't be confirmed"] });
+      changed.push(x); continue;
+    }
+    if (lRealSku(x.labelSku)) continue;
+    const m = groups.get(labelsTitle(x.title));
+    if (!m || m.size < 2) continue;
+    const top = [...m].sort((a, b) => b[1] - a[1]);
+    if (top[0][1] > top[1][1] && sku === top[0][0]) continue;
+    Object.assign(x, { good: false, kind: "wrong", reasons: [`wrong line: this line holds ${m.size} different products in Sellercloud (most are ${top[0][0]}); this order is ${sku}`] });
+    changed.push(x);
+  }
+  return changed;
+}
 async function labelsCheckRun(env, date, opts = {}) {
   const day = await labelsCall(env, "/day", { date });
   try { await labelsAddScSkus(env, day, date); } catch {}
@@ -5652,6 +5685,9 @@ async function labelsCheckRun(env, date, opts = {}) {
     results.push(r);
   }
   if (results.length) {
+    const byId = new Map(Object.values(stored).map((x) => [x.id, x]));
+    for (const x of results) byId.set(x.id, x);
+    labelsLineRules(results, [...byId.values()]);
     await labelsChecks(env, date); // moves an older KV blob over first, so its "aside" marks are kept
     await labelsCall(env, "/checks-put", { date, items: results.map(({ scId, carrier, service, ...keep }) => keep) }).catch(() => {});
   }
@@ -5792,15 +5828,16 @@ async function autoshipRoute(env, url) {
     const date = (url.searchParams.get("date") || "").trim();
     if (!isDay(date)) return Response.json({ error: "add &date=YYYY-MM-DD" }, { status: 400 });
     const vals = Object.values(await labelsChecks(env, date));
-    const hit = [];
+    const hit = labelsLineRules(vals.filter((x) => x.good).map((x) => ({ ...x })), vals);
     for (const x of vals) {
+      if (hit.some((h) => h.id === x.id)) continue;
       const rowSku = x.labelSku && x.labelSku !== "UNKNOWN" ? x.labelSku : "";
       if (!x.good || !rowSku || !x.items || x.items.length !== 1 || x.items[0].sku === rowSku) continue;
       const v = { ...x, good: false, kind: "wrong", reasons: [`wrong line: this line is ${rowSku} but Sellercloud has ${x.items[0].sku} for this order`] };
       hit.push(v);
     }
     if (url.searchParams.get("go") === "1" && hit.length) await labelsCall(env, "/checks-put", { date, items: hit });
-    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku, x.items[0].sku + " x" + x.items[0].qty, x.shipped]) });
+    return Response.json({ wrote: url.searchParams.get("go") === "1", n: hit.length, list: hit.map((x) => [x.po, x.labelSku || String(x.title || "").slice(0, 40), x.items[0].sku + " x" + x.items[0].qty, x.kind]) });
   }
   if (api === "rows") {
     // Read only: stored checks grouped by the label's product; lists groups holding more than one Sellercloud product.
@@ -5816,6 +5853,8 @@ async function autoshipRoute(env, url) {
       (e.sc[sk] = e.sc[sk] || []).push([x.po, x.good, x.kind]);
       g.set(k, e);
     }
+    const q = (url.searchParams.get("q") || "").toLowerCase();
+    if (q) return Response.json({ recs: vals.filter((x) => String(x.title || "").toLowerCase().includes(q)).map((x) => [x.po, x.labelSku, x.good, x.kind, x.labelQty, (x.items || []).map((i) => i.sku + " x" + i.qty + " " + String(i.name || "").slice(0, 50)).join(" + ")]) });
     const out = [...g].filter(([, e]) => Object.keys(e.sc).length > 1).map(([k, e]) => ({ row: k, n: e.n, sc: Object.fromEntries(Object.entries(e.sc).map(([a, b]) => [a, b.length > 6 ? b.length : b])) }));
     return Response.json({ groups: g.size, mixedRows: out.length, rows: out });
   }
